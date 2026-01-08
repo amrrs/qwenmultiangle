@@ -396,8 +396,9 @@ function initThreeJS() {
     function updateVisuals() {
         const azRad = (liveAzimuth * Math.PI) / 180;
         const elRad = (liveElevation * Math.PI) / 180;
-        // Distance affects how far the camera indicator is (1-10 mapped to visual distance)
-        const visualDist = 0.8 + (liveDistance / 10) * 1.5;
+        // Zoom: 0=wide (far), 10=close-up (near) - invert for visual representation
+        // Higher zoom = camera closer to subject visually
+        const visualDist = 2.3 - (liveDistance / 10) * 1.5;
         
         // Camera indicator
         const camX = visualDist * Math.sin(azRad) * Math.cos(elRad);
@@ -428,7 +429,8 @@ function initThreeJS() {
         elGlow.position.copy(elevationHandle.position);
         
         // Distance handle - between center and camera
-        const distT = 0.3 + (liveDistance / 10) * 0.4;
+        // Higher zoom = handle closer to center (represents camera closer to subject)
+        const distT = 0.7 - (liveDistance / 10) * 0.4;
         distanceHandle.position.lerpVectors(CENTER, cameraIndicator.position, distT);
         
         // Distance line
@@ -550,7 +552,8 @@ function initThreeJS() {
             }
         } else if (dragTarget === 'distance') {
             // Map mouse Y to zoom (0-10) per fal.ai API
-            const newDist = 5 - mouse.y * 5;
+            // Dragging up (positive Y) = higher zoom = closer shot
+            const newDist = 5 + mouse.y * 5;
             liveDistance = Math.max(0, Math.min(10, newDist));
             state.distance = Math.round(liveDistance * 10) / 10; // Round to 1 decimal
             elements.distanceSlider.value = state.distance;
