@@ -629,8 +629,6 @@ input[type="range"]::-moz-range-thumb {
 }
 
 .output-container {
-    flex: 1;
-    min-height: 400px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -640,6 +638,8 @@ input[type="range"]::-moz-range-thumb {
     overflow: hidden;
     position: relative;
     transition: all var(--transition-normal);
+    aspect-ratio: 1 / 1;
+    max-height: 512px;
 }
 
 /* Loading state shimmer effect */
