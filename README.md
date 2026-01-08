@@ -5,6 +5,10 @@ A modern web app for controlling camera angles on images using the Qwen Image Ed
 ![Preview](https://img.shields.io/badge/Three.js-black?style=flat&logo=three.js&logoColor=white)
 ![fal.ai](https://img.shields.io/badge/fal.ai-API-blue)
 
+## Screenshot
+
+![Qwen Multi-Angle App](qwenmultiangle.png)
+
 ## Features
 
 - 🎮 **3D Camera Control** - Interactive Three.js viewport with draggable handles for azimuth, elevation, and distance
