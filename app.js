@@ -428,9 +428,9 @@ function initThreeJS() {
         elevationHandle.position.set(elX, elY, elZ);
         elGlow.position.copy(elevationHandle.position);
         
-        // Distance handle - between center and camera
-        // Higher zoom = handle closer to center (represents camera closer to subject)
-        const distT = 0.7 - (liveDistance / 10) * 0.4;
+        // Distance handle - between center and camera indicator
+        // Higher zoom = handle farther out (toward camera), lower zoom = handle closer to center
+        const distT = 0.3 + (liveDistance / 10) * 0.4;
         distanceHandle.position.lerpVectors(CENTER, cameraIndicator.position, distT);
         
         // Distance line
@@ -552,8 +552,9 @@ function initThreeJS() {
             }
         } else if (dragTarget === 'distance') {
             // Map mouse Y to zoom (0-10) per fal.ai API
-            // Dragging up (positive Y) = higher zoom = closer shot
-            const newDist = 5 + mouse.y * 5;
+            // Dragging outward/up = wider shot (lower zoom)
+            // Dragging inward/down = closer shot (higher zoom)
+            const newDist = 5 - mouse.y * 5;
             liveDistance = Math.max(0, Math.min(10, newDist));
             state.distance = Math.round(liveDistance * 10) / 10; // Round to 1 decimal
             elements.distanceSlider.value = state.distance;
@@ -640,23 +641,29 @@ function initThreeJS() {
         },
         updateImage: (url) => {
             if (url) {
-                const loader = new THREE.TextureLoader();
-                loader.setCrossOrigin('anonymous');
-                loader.load(url, 
-                    (tex) => {
-                        planeMat.map = tex;
-                        planeMat.color.set(0xffffff);
-                        planeMat.needsUpdate = true;
-                        const ar = tex.image.width / tex.image.height;
-                        imagePlane.scale.set(ar > 1 ? 0.9 : 0.9 * ar, ar > 1 ? 0.9 / ar : 0.9, 1);
-                    },
-                    undefined,
-                    () => {
-                        planeMat.map = null;
-                        planeMat.color.set(0xE93D82);
-                        planeMat.needsUpdate = true;
-                    }
-                );
+                // For base64 data URLs, load directly via Image element
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
+                
+                img.onload = () => {
+                    const tex = new THREE.Texture(img);
+                    tex.needsUpdate = true;
+                    planeMat.map = tex;
+                    planeMat.color.set(0xffffff);
+                    planeMat.needsUpdate = true;
+                    const ar = img.width / img.height;
+                    imagePlane.scale.set(ar > 1 ? 0.9 : 0.9 * ar, ar > 1 ? 0.9 / ar : 0.9, 1);
+                    console.log('3D scene: Image loaded successfully');
+                };
+                
+                img.onerror = (err) => {
+                    console.warn('3D scene: Could not load image, showing placeholder', err);
+                    planeMat.map = null;
+                    planeMat.color.set(0xE93D82);
+                    planeMat.needsUpdate = true;
+                };
+                
+                img.src = url;
             } else {
                 planeMat.map = null;
                 planeMat.color.set(0x1a1a2e);
