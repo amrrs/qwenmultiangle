@@ -54,6 +54,63 @@ let pathState = {
 const elements = {};
 const pathElements = {};
 
+// ===== Seedance Segment Cache (localStorage) =====
+const AI_SEGMENTS_CACHE_KEY = 'qwenmultiangle_ai_segments_cache_v1';
+const AI_SEGMENTS_CACHE_MAX_ENTRIES = 15;
+
+function safeJsonParse(str, fallback) {
+    try { return JSON.parse(str); } catch (_) { return fallback; }
+}
+
+function loadAICache() {
+    const raw = localStorage.getItem(AI_SEGMENTS_CACHE_KEY);
+    const data = safeJsonParse(raw, {});
+    if (!data || typeof data !== 'object') return {};
+    return data;
+}
+
+function saveAICache(cacheObj) {
+    try {
+        localStorage.setItem(AI_SEGMENTS_CACHE_KEY, JSON.stringify(cacheObj));
+    } catch (e) {
+        // If storage is full, best-effort: clear cache
+        try { localStorage.removeItem(AI_SEGMENTS_CACHE_KEY); } catch (_) {}
+    }
+}
+
+function pruneAICache(cacheObj) {
+    const entries = Object.entries(cacheObj || {});
+    if (entries.length <= AI_SEGMENTS_CACHE_MAX_ENTRIES) return cacheObj;
+    // Sort by createdAt desc, keep newest N
+    entries.sort((a, b) => (b[1]?.createdAt || 0) - (a[1]?.createdAt || 0));
+    const pruned = {};
+    entries.slice(0, AI_SEGMENTS_CACHE_MAX_ENTRIES).forEach(([k, v]) => { pruned[k] = v; });
+    return pruned;
+}
+
+function hashStringFNV1a(input) {
+    // Small, deterministic hash for cache keys (not crypto)
+    let h = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        h ^= input.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    // unsigned
+    return (h >>> 0).toString(16);
+}
+
+function buildSeedanceSegmentsCacheKey({ keyframeUrls, prompt, resolution, seedanceSeconds, loop }) {
+    // IMPORTANT: do NOT include per-pair seconds here (so you can re-stitch without re-generating)
+    const payload = JSON.stringify({
+        keyframeUrls,
+        prompt,
+        resolution,
+        seedanceSeconds,
+        loop: !!loop
+    });
+    return `seg_${hashStringFNV1a(payload)}`;
+}
+
 // ===== Utility Functions =====
 function snapToNearest(value, options) {
     return options.reduce((prev, curr) => 
@@ -2426,54 +2483,82 @@ async function generateAIVideo() {
     const pairSeconds = parseFloat(pathElements.aiPairSeconds?.value || '1');
     const seedanceSegmentSeconds = 4; // API minimum
     const speedMultiplier = seedanceSegmentSeconds / Math.max(0.5, pairSeconds);
-    const totalSegments = keyframes.length - 1;
+    const loopPath = !!pathElements.aiLoopPath?.checked;
+    const totalSegments = loopPath ? keyframes.length : (keyframes.length - 1);
+    const keyframeUrls = keyframes.map(k => k.generatedImageUrl);
+    const cacheKey = buildSeedanceSegmentsCacheKey({
+        keyframeUrls,
+        prompt,
+        resolution,
+        seedanceSeconds: seedanceSegmentSeconds,
+        loop: loopPath
+    });
     
     fal.config({ credentials: apiKey });
     
     addPathLog(`Generating ${totalSegments} Seedance segments (${seedanceSegmentSeconds}s each → ${pairSeconds}s after speedup, ${speedMultiplier.toFixed(2)}x)`, 'info');
     addPathLog(`Prompt: "${prompt}"`, 'info');
     
-    // Step 1: Generate all Seedance segments
-    const segmentUrls = [];
-    for (let i = 0; i < totalSegments; i++) {
-        const startFrame = keyframes[i];
-        const endFrame = keyframes[i + 1];
-        
-        pathElements.videoProgressFill.style.width = `${((i + 0.5) / totalSegments) * 70}%`;
-        pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments}`;
-        
-        addPathLog(`Segment ${i + 1}: Frame ${i + 1} (Az=${startFrame.azimuth}°) → Frame ${i + 2} (Az=${endFrame.azimuth}°)`, 'request');
-        
-        try {
-            const result = await fal.subscribe(CONFIG.SEEDANCE_MODEL_ID, {
-                input: {
-                    prompt: prompt,
-                    image_url: startFrame.generatedImageUrl,
-                    end_image_url: endFrame.generatedImageUrl,
-                    duration: String(seedanceSegmentSeconds), // API minimum; we speed up in stitching
-                    resolution: resolution,
-                    camera_fixed: false,
-                    generate_audio: false
-                },
-                logs: false,
-                onQueueUpdate: (update) => {
-                    if (update.status === 'IN_QUEUE') {
-                        pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments} (queued)`;
-                    } else if (update.status === 'IN_PROGRESS') {
-                        pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments} (rendering)`;
-                    }
-                }
-            });
+    // Step 1: Use cached Seedance segment URLs if available (so we don’t re-queue every time)
+    let segmentUrls = [];
+    const cache = loadAICache();
+    const cachedEntry = cache?.[cacheKey];
+    if (cachedEntry?.segmentUrls?.length === totalSegments) {
+        segmentUrls = cachedEntry.segmentUrls.slice(0);
+        addPathLog(`Cache hit: reusing ${segmentUrls.length} Seedance segments (no model calls).`, 'info');
+        pathElements.videoProgressFill.style.width = '20%';
+        pathElements.videoProgressText.textContent = 'Using cached segments...';
+    } else {
+        // Generate all Seedance segments
+        for (let i = 0; i < totalSegments; i++) {
+            const startFrame = keyframes[i];
+            const endFrame = keyframes[(i + 1) % keyframes.length];
             
-            const videoUrl = result?.data?.video?.url || result?.video?.url;
-            if (videoUrl) {
-                segmentUrls.push(videoUrl);
-                addPathLog(`Segment ${i + 1} done!`, 'response');
-            } else {
-                addPathLog(`Segment ${i + 1}: No video in response`, 'error');
+            pathElements.videoProgressFill.style.width = `${((i + 0.5) / totalSegments) * 70}%`;
+            pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments}`;
+            
+            const endLabel = (i + 1) < keyframes.length ? (i + 2) : 1;
+            addPathLog(`Segment ${i + 1}: Frame ${i + 1} (Az=${startFrame.azimuth}°) → Frame ${endLabel} (Az=${endFrame.azimuth}°)`, 'request');
+            
+            try {
+                const result = await fal.subscribe(CONFIG.SEEDANCE_MODEL_ID, {
+                    input: {
+                        prompt: prompt,
+                        image_url: startFrame.generatedImageUrl,
+                        end_image_url: endFrame.generatedImageUrl,
+                        duration: String(seedanceSegmentSeconds), // API minimum; we speed up in stitching
+                        resolution: resolution,
+                        camera_fixed: false,
+                        generate_audio: false
+                    },
+                    logs: false,
+                    onQueueUpdate: (update) => {
+                        if (update.status === 'IN_QUEUE') {
+                            pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments} (queued)`;
+                        } else if (update.status === 'IN_PROGRESS') {
+                            pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments} (rendering)`;
+                        }
+                    }
+                });
+                
+                const videoUrl = result?.data?.video?.url || result?.video?.url;
+                if (videoUrl) {
+                    segmentUrls.push(videoUrl);
+                    addPathLog(`Segment ${i + 1} done!`, 'response');
+                } else {
+                    addPathLog(`Segment ${i + 1}: No video in response`, 'error');
+                }
+            } catch (err) {
+                addPathLog(`Segment ${i + 1} failed: ${formatError(err)}`, 'error');
             }
-        } catch (err) {
-            addPathLog(`Segment ${i + 1} failed: ${formatError(err)}`, 'error');
+        }
+
+        // Save cache only if complete
+        if (segmentUrls.length === totalSegments) {
+            const nextCache = loadAICache();
+            nextCache[cacheKey] = { createdAt: Date.now(), segmentUrls };
+            saveAICache(pruneAICache(nextCache));
+            addPathLog('Saved Seedance segments to cache. Next run can skip the queue.', 'info');
         }
     }
     
@@ -2501,8 +2586,8 @@ async function generateAIVideo() {
         pathElements.videoProgressText.textContent = 'Stitching with 4x speedup...';
         pathElements.videoProgressFill.style.width = '85%';
         
-        // Stitch with speedup
-        const finalBlob = await stitchAndSpeedupVideos(videoBlobs, speedMultiplier);
+        // Stitch with speedup (playback-rate stitching to avoid stretched durations)
+        const finalBlob = await stitchAndSpeedupVideos(videoBlobs, speedMultiplier, pairSeconds);
         
         pathState.generatedVideoBlob = finalBlob;
         pathState.generatedVideoUrl = URL.createObjectURL(finalBlob);
@@ -2544,78 +2629,116 @@ function resetVideoUI() {
     updatePathButtons();
 }
 
-// Stitch video blobs with speedup - extracts frames and re-encodes
-async function stitchAndSpeedupVideos(videoBlobs, speedMultiplier) {
+// Stitch video blobs with speedup using playbackRate + canvas recording.
+// This avoids the “1 minute output” bug caused by slow frame pumping.
+async function stitchAndSpeedupVideos(videoBlobs, speedMultiplier, targetSecondsPerSegment = 1) {
     const canvas = document.createElement('canvas');
     canvas.width = 1280;
     canvas.height = 720;
     const ctx = canvas.getContext('2d');
-    
-    // Collect all frames first (not real-time)
-    const allFrames = [];
+
     const fps = 30;
-    
-    for (let i = 0; i < videoBlobs.length; i++) {
-        addPathLog(`Extracting frames from segment ${i + 1}...`, 'info');
-        
-        const video = document.createElement('video');
-        video.muted = true;
-        video.playsInline = true;
-        video.src = URL.createObjectURL(videoBlobs[i]);
-        
-        await new Promise(r => { video.onloadedmetadata = r; });
-        
-        const duration = video.duration;
-        const outputFrameCount = Math.floor((duration / speedMultiplier) * fps);
-        
-        for (let f = 0; f < outputFrameCount; f++) {
-            const seekTime = (f / outputFrameCount) * duration;
-            video.currentTime = seekTime;
-            await new Promise(r => { video.onseeked = r; });
-            
-            // Capture frame to ImageData
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            allFrames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
-        }
-        
-        URL.revokeObjectURL(video.src);
-    }
-    
-    addPathLog(`Encoding ${allFrames.length} frames...`, 'info');
-    
-    // Now encode all frames (fast, not real-time)
     const stream = canvas.captureStream(fps);
     const mediaRecorder = new MediaRecorder(stream, {
         mimeType: 'video/webm;codecs=vp9',
         videoBitsPerSecond: 8000000
     });
-    
+
     const chunks = [];
-    mediaRecorder.ondataavailable = e => chunks.push(e.data);
-    
-    return new Promise((resolve) => {
-        mediaRecorder.onstop = () => {
-            resolve(new Blob(chunks, { type: 'video/webm' }));
-        };
-        
-        mediaRecorder.start();
-        
-        let frameIndex = 0;
-        const frameInterval = 1000 / fps;
-        
-        function drawNextFrame() {
-            if (frameIndex < allFrames.length) {
-                ctx.putImageData(allFrames[frameIndex], 0, 0);
-                frameIndex++;
-                setTimeout(drawNextFrame, frameInterval);
-            } else {
-                // Add small delay then stop
-                setTimeout(() => mediaRecorder.stop(), 100);
-            }
-        }
-        
-        drawNextFrame();
+    mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+
+    const done = new Promise((resolve) => {
+        mediaRecorder.onstop = () => resolve(new Blob(chunks, { type: 'video/webm' }));
     });
+
+    mediaRecorder.start();
+
+    // Helper: draw video to canvas with cover scaling
+    function drawCover(video) {
+        const vw = video.videoWidth || 1;
+        const vh = video.videoHeight || 1;
+        const scale = Math.max(canvas.width / vw, canvas.height / vh);
+        const w = vw * scale;
+        const h = vh * scale;
+        const x = (canvas.width - w) / 2;
+        const y = (canvas.height - h) / 2;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, x, y, w, h);
+    }
+
+    // Play each segment at playbackRate=speedMultiplier and record while drawing.
+    // IMPORTANT: record a fixed duration per segment (targetSecondsPerSegment) so slow
+    // rendering/buffering can’t accidentally create a 1+ minute output.
+    for (let i = 0; i < videoBlobs.length; i++) {
+        addPathLog(`Stitching segment ${i + 1}/${videoBlobs.length}: ${targetSecondsPerSegment}s at ${speedMultiplier.toFixed(2)}x speed...`, 'info');
+
+        const blobUrl = URL.createObjectURL(videoBlobs[i]);
+        const video = document.createElement('video');
+        video.muted = true;
+        video.playsInline = true;
+        video.crossOrigin = 'anonymous';
+        video.preload = 'auto';
+        video.src = blobUrl;
+
+        await new Promise((resolve, reject) => {
+            video.onloadedmetadata = resolve;
+            video.onerror = () => reject(new Error('Failed to load video segment'));
+        });
+
+        video.playbackRate = speedMultiplier;
+        // Ensure we can actually render frames (helps avoid long black starts)
+        await new Promise((resolve) => {
+            const done = () => resolve();
+            if (video.readyState >= 2) return done();
+            video.oncanplay = done;
+        });
+
+        // Start at 0
+        try { video.currentTime = 0; } catch (_) {}
+        await new Promise((resolve) => {
+            const done = () => resolve();
+            video.onseeked = done;
+            // If seeked doesn’t fire (already at 0), resolve soon
+            setTimeout(done, 50);
+        });
+
+        // Start playing (user gesture should allow this)
+        try {
+            await video.play();
+        } catch (e) {
+            addPathLog(`Warning: video.play() failed, stitching may be frozen. ${formatError(e)}`, 'warn');
+        }
+
+        const segmentStart = performance.now();
+        let lastDraw = 0;
+        await new Promise((resolve) => {
+            const tick = (ts) => {
+                const elapsed = ts - segmentStart;
+                if (elapsed >= targetSecondsPerSegment * 1000) {
+                    resolve();
+                    return;
+                }
+                if (!lastDraw || ts - lastDraw >= 1000 / fps) {
+                    drawCover(video);
+                    lastDraw = ts;
+                }
+                requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+        });
+
+        video.pause();
+        URL.revokeObjectURL(blobUrl);
+    }
+
+    // Small tail frame so the last frame lands
+    await new Promise((r) => setTimeout(r, 100));
+    mediaRecorder.stop();
+
+    return done;
 }
 
 // ===== Video Mode Toggle =====
@@ -2846,6 +2969,7 @@ function init() {
     pathElements.aiDuration = document.getElementById('ai-duration');
     pathElements.aiResolution = document.getElementById('ai-resolution');
     pathElements.aiPairSeconds = document.getElementById('ai-pair-seconds');
+    pathElements.aiLoopPath = document.getElementById('ai-loop-path');
     pathElements.statusMessage = document.getElementById('path-status-message');
     pathElements.logsContainer = document.getElementById('path-logs-container');
     pathElements.clearLogsBtn = document.getElementById('path-clear-logs');

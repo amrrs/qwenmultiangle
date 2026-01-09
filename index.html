@@ -61,7 +61,6 @@
                     <path d="M3 7v10l9 5 9-5V7"/>
                 </svg>
                 Camera motion
-                <span class="mode-badge" style="margin-top:6px;">Coming soon</span>
             </button>
         </nav>
 
@@ -336,37 +335,35 @@
                 </main>
             </div>
 
-            <!-- ========== CAMERA MOTION TAB (COMING SOON) ========== -->
+            <!-- ========== CAMERA MOTION TAB ========== -->
             <div class="tab-panel" id="camera-motion-panel">
                 <main class="main-content">
                     <section class="left-panel">
                         <div class="panel-card">
-                            <h3 class="card-title">Camera Motion (Coming Soon)</h3>
-                            <p class="card-subtitle">This tab will handle queued AI video generation + stitching. For now, use Multi-image to generate keyframes.</p>
+                            <h3 class="card-title">Camera Motion</h3>
+                            <p class="card-subtitle">Generate video from the keyframes you created in Multi-image.</p>
                             <div class="ai-info">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <circle cx="12" cy="12" r="10"/>
                                     <path d="M12 16v-4M12 8h.01"/>
                                 </svg>
-                                <span>Seedance / camera-motion workflows are being rebuilt to avoid long waits and confusing queue behavior.</span>
+                                <span>Tip: Generate keyframes first in Multi-image, then come here to create camera motion video.</span>
                             </div>
                         </div>
                     </section>
                     <section class="right-panel">
                         <div class="panel-card video-card">
                             <h3 class="card-title">Create Camera Motion Video</h3>
-                            <p class="card-subtitle">Coming soon</p>
-
-                            <!-- Keep existing IDs so JS wiring doesn't break; disable everything -->
+                            <p class="card-subtitle">Quick Stitch is instant. AI Video uses Seedance (queued).</p>
                             <div class="video-mode-toggle">
-                                <button class="mode-btn active" data-mode="quick" disabled>
+                                <button class="mode-btn active" data-mode="quick">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                         <polygon points="5 3 19 12 5 21 5 3"/>
                                     </svg>
                                     Quick Stitch
                                     <span class="mode-badge">Instant</span>
                                 </button>
-                                <button class="mode-btn" data-mode="ai" disabled>
+                                <button class="mode-btn" data-mode="ai">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                         <path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/>
                                         <path d="M12 14c-4 0-8 2-8 4v2h16v-2c0-2-4-4-8-4z"/>
@@ -380,7 +377,7 @@
                                 <div class="setting-row">
                                     <div class="setting-group">
                                         <label for="video-duration">Total Duration</label>
-                                        <select id="video-duration" disabled>
+                                        <select id="video-duration">
                                             <option value="3">3 seconds</option>
                                             <option value="4">4 seconds</option>
                                             <option value="5" selected>5 seconds</option>
@@ -390,7 +387,7 @@
                                     </div>
                                     <div class="setting-group">
                                         <label for="transition-style">Transition Style</label>
-                                        <select id="transition-style" disabled>
+                                        <select id="transition-style">
                                             <option value="crane-zoom" selected>Crane Zoom</option>
                                             <option value="smooth-pan">Smooth Pan</option>
                                             <option value="whip-pan">Whip Pan</option>
@@ -401,7 +398,7 @@
                                 <div class="setting-row">
                                     <div class="setting-group">
                                         <label for="video-fps">Frame Rate</label>
-                                        <select id="video-fps" disabled>
+                                        <select id="video-fps">
                                             <option value="24">24 fps (Cinematic)</option>
                                             <option value="30" selected>30 fps</option>
                                             <option value="60">60 fps (Smooth)</option>
@@ -409,7 +406,7 @@
                                     </div>
                                     <div class="setting-group">
                                         <label for="ease-type">Easing</label>
-                                        <select id="ease-type" disabled>
+                                        <select id="ease-type">
                                             <option value="ease-in-out" selected>Ease In-Out</option>
                                             <option value="ease-out">Ease Out</option>
                                             <option value="linear">Linear</option>
@@ -422,21 +419,28 @@
                             <div class="video-settings hidden" id="ai-settings">
                                 <div class="setting-group">
                                     <label for="ai-prompt">Motion Prompt</label>
-                                    <textarea id="ai-prompt" rows="2" disabled>The camera very slowly and smoothly lowers on a boom. The subject moves barely moves, and is extremely deliberate and thoughtful in his movement.</textarea>
+                                    <textarea id="ai-prompt" rows="2">The camera very slowly and smoothly lowers on a boom. The subject moves barely moves, and is extremely deliberate and thoughtful in his movement.</textarea>
                                 </div>
                                 <div class="setting-group">
                                     <label for="ai-resolution">Resolution</label>
-                                    <select id="ai-resolution" disabled>
+                                    <select id="ai-resolution">
                                         <option value="480p">480p (Faster)</option>
                                         <option value="720p" selected>720p</option>
                                     </select>
                                 </div>
                                 <div class="setting-group">
                                     <label for="ai-pair-seconds">Per-pair duration (after speedup)</label>
-                                    <select id="ai-pair-seconds" disabled>
+                                    <select id="ai-pair-seconds">
                                         <option value="1" selected>1 second (fast)</option>
                                         <option value="2">2 seconds (slower)</option>
+                                        <option value="3">3 seconds (smooth)</option>
                                     </select>
+                                </div>
+                                <div class="setting-group">
+                                    <label style="display:flex; align-items:center; gap:10px;">
+                                        <input type="checkbox" id="ai-loop-path" style="transform: translateY(1px);">
+                                        Loop back to start (adds last → first)
+                                    </label>
                                 </div>
                             </div>
 
@@ -464,7 +468,7 @@
                                         <polygon points="23 7 16 12 23 17 23 7"/>
                                         <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
                                     </svg>
-                                    <p>Coming soon</p>
+                                    <p>Generated video will appear here</p>
                                 </div>
                                 <video id="final-video" class="final-video hidden" controls loop></video>
                                 <canvas id="video-canvas" class="hidden"></canvas>
