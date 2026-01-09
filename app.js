@@ -4,7 +4,10 @@ import { fal } from "https://esm.sh/@fal-ai/client@1.2.1";
 // ===== Configuration =====
 const CONFIG = {
     FAL_MODEL_ID: 'fal-ai/qwen-image-edit-2511-multiple-angles',
-    MAX_SEED: 2147483647
+    SEEDANCE_MODEL_ID: 'fal-ai/bytedance/seedance/v1.5/pro/image-to-video',
+    MAX_SEED: 2147483647,
+    MAX_WAYPOINTS: 4,
+    MIN_WAYPOINTS: 2
 };
 
 // ===== Camera Angle Labels (for UI display only) =====
@@ -34,8 +37,22 @@ let state = {
     isGenerating: false
 };
 
+// ===== Path State =====
+let pathState = {
+    waypoints: [],           // Array of {id, azimuth, elevation, distance, generatedImageUrl}
+    uploadedImage: null,
+    uploadedImageBase64: null,
+    imageUrl: null,
+    isGeneratingKeyframes: false,
+    isGeneratingVideos: false,
+    generatedVideoUrl: null,
+    generatedVideoBlob: null,
+    videoMode: 'quick'       // 'quick' or 'ai'
+};
+
 // ===== DOM Elements =====
 const elements = {};
+const pathElements = {};
 
 // ===== Utility Functions =====
 function snapToNearest(value, options) {
@@ -422,6 +439,53 @@ function initThreeJS() {
         scene.add(distanceTube);
     }
     
+    // ===== Projection Guide Lines (dotted) =====
+    // Vertical line: Camera down to azimuth ring (shows XZ projection)
+    const verticalGuideGeo = new THREE.BufferGeometry();
+    const verticalGuideMat = new THREE.LineDashedMaterial({
+        color: 0xE93D82,
+        dashSize: 0.1,
+        gapSize: 0.05,
+        transparent: true,
+        opacity: 0.6
+    });
+    const verticalGuide = new THREE.Line(verticalGuideGeo, verticalGuideMat);
+    scene.add(verticalGuide);
+    
+    // Horizontal line: Ground projection to center (shows azimuth direction)
+    const horizontalGuideGeo = new THREE.BufferGeometry();
+    const horizontalGuideMat = new THREE.LineDashedMaterial({
+        color: 0xE93D82,
+        dashSize: 0.1,
+        gapSize: 0.05,
+        transparent: true,
+        opacity: 0.6
+    });
+    const horizontalGuide = new THREE.Line(horizontalGuideGeo, horizontalGuideMat);
+    scene.add(horizontalGuide);
+    
+    // Elevation projection line: Camera to elevation arc plane
+    const elevationGuideGeo = new THREE.BufferGeometry();
+    const elevationGuideMat = new THREE.LineDashedMaterial({
+        color: 0x00FFD0,
+        dashSize: 0.1,
+        gapSize: 0.05,
+        transparent: true,
+        opacity: 0.6
+    });
+    const elevationGuide = new THREE.Line(elevationGuideGeo, elevationGuideMat);
+    scene.add(elevationGuide);
+    
+    // Small sphere at ground projection point
+    const groundMarkerGeo = new THREE.SphereGeometry(0.06, 16, 16);
+    const groundMarkerMat = new THREE.MeshBasicMaterial({ 
+        color: 0xE93D82,
+        transparent: true,
+        opacity: 0.7
+    });
+    const groundMarker = new THREE.Mesh(groundMarkerGeo, groundMarkerMat);
+    scene.add(groundMarker);
+    
     // ===== Update Visual Positions =====
     function updateVisuals() {
         const azRad = (liveAzimuth * Math.PI) / 180;
@@ -464,6 +528,35 @@ function initThreeJS() {
         
         // Distance line from center to camera
         updateDistanceLine(CENTER.clone(), cameraIndicator.position.clone());
+        
+        // ===== Update Projection Guide Lines =====
+        // Ground projection point (camera position projected to azimuth ring height)
+        const groundProjection = new THREE.Vector3(camX, 0.05, camZ);
+        groundMarker.position.copy(groundProjection);
+        
+        // Vertical guide: Camera -> Ground projection
+        verticalGuideGeo.setFromPoints([
+            cameraIndicator.position.clone(),
+            groundProjection.clone()
+        ]);
+        verticalGuide.computeLineDistances();
+        
+        // Horizontal guide: Ground projection -> Center (at ground level)
+        const centerGround = new THREE.Vector3(0, 0.05, 0);
+        horizontalGuideGeo.setFromPoints([
+            groundProjection.clone(),
+            centerGround.clone()
+        ]);
+        horizontalGuide.computeLineDistances();
+        
+        // Elevation guide: Camera -> point on elevation arc at same height
+        // This shows the horizontal projection to the elevation arc
+        const elevArcPoint = new THREE.Vector3(ELEV_ARC_X, camY, elZ);
+        elevationGuideGeo.setFromPoints([
+            cameraIndicator.position.clone(),
+            elevArcPoint.clone()
+        ]);
+        elevationGuide.computeLineDistances();
         
         // Animate glow ring (rotating on ground)
         glowRing.rotation.z += 0.005;
@@ -1217,9 +1310,1480 @@ function setupEventListeners() {
     }
 }
 
+// ===== Tab Switching =====
+function setupTabSwitching() {
+    const tabBtns = document.querySelectorAll('.tab-btn');
+    const tabPanels = document.querySelectorAll('.tab-panel');
+    
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const targetTab = btn.dataset.tab;
+            
+            // Update buttons
+            tabBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            
+            // Update panels
+            tabPanels.forEach(panel => {
+                panel.classList.remove('active');
+                if (panel.id === `${targetTab}-panel`) {
+                    panel.classList.add('active');
+                }
+            });
+            
+            // Initialize multi-image scene when switching to multi-image tab
+            if (targetTab === 'multi-image' && !pathThreeScene) {
+                setTimeout(() => initPathThreeJS(), 100);
+            }
+
+            // Sync image from Single Angle tab into Camera Path tab automatically
+            if (targetTab === 'multi-image') {
+                setTimeout(() => {
+                    syncPathImageFromSingleAngle();
+                    updatePathButtons();
+                }, 50);
+            }
+        });
+    });
+}
+
+function syncPathImageFromSingleAngle() {
+    // If Path tab already has an image, do nothing
+    if (pathState.imageUrl || pathState.uploadedImage || pathState.uploadedImageBase64) return;
+    // If Single Angle tab has no image, do nothing
+    if (!state.imageUrl && !state.uploadedImage && !state.uploadedImageBase64) return;
+
+    // Copy URL-based image
+    if (state.imageUrl) {
+        pathState.imageUrl = state.imageUrl;
+        pathState.uploadedImage = null;
+        pathState.uploadedImageBase64 = null;
+
+        if (pathElements.imageUrlInput) pathElements.imageUrlInput.value = state.imageUrl;
+        if (pathElements.previewImage) {
+            pathElements.previewImage.src = state.imageUrl;
+            pathElements.previewImage.classList.remove('hidden');
+        }
+        if (pathElements.uploadPlaceholder) pathElements.uploadPlaceholder.classList.add('hidden');
+        if (pathElements.clearImage) pathElements.clearImage.classList.remove('hidden');
+        if (pathElements.uploadZone) pathElements.uploadZone.classList.add('has-image');
+
+        if (pathThreeScene) pathThreeScene.updateImage(state.imageUrl);
+        addPathLog('Synced image from Single Angle tab (URL)', 'info');
+        return;
+    }
+
+    // Copy uploaded file + base64 preview
+    if (state.uploadedImageBase64 && state.uploadedImage) {
+        pathState.uploadedImage = state.uploadedImage;
+        pathState.uploadedImageBase64 = state.uploadedImageBase64;
+        pathState.imageUrl = null;
+
+        if (pathElements.imageUrlInput) pathElements.imageUrlInput.value = '';
+        if (pathElements.previewImage) {
+            pathElements.previewImage.src = state.uploadedImageBase64;
+            pathElements.previewImage.classList.remove('hidden');
+        }
+        if (pathElements.uploadPlaceholder) pathElements.uploadPlaceholder.classList.add('hidden');
+        if (pathElements.clearImage) pathElements.clearImage.classList.remove('hidden');
+        if (pathElements.uploadZone) pathElements.uploadZone.classList.add('has-image');
+
+        if (pathThreeScene) pathThreeScene.updateImage(state.uploadedImageBase64);
+        addPathLog('Synced image from Single Angle tab (uploaded file)', 'info');
+    }
+}
+
+// ===== Path Three.js Scene =====
+let pathThreeScene = null;
+
+function initPathThreeJS() {
+    const container = pathElements.threejsContainer;
+    if (!container) return;
+    
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+    
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0f);
+    
+    // Camera
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
+    camera.position.set(4, 3.5, 4);
+    camera.lookAt(0, 0.5, 0);
+    
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    container.appendChild(renderer.domElement);
+    
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+    
+    const mainLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    mainLight.position.set(5, 10, 5);
+    scene.add(mainLight);
+    
+    // Grid
+    const gridHelper = new THREE.GridHelper(5, 20, 0x1a1a2e, 0x12121a);
+    gridHelper.position.y = -0.01;
+    scene.add(gridHelper);
+    
+    // Constants
+    const CENTER = new THREE.Vector3(0, 0.5, 0);
+    const SPHERE_RADIUS = 2.0;
+    const MIN_ZOOM = 0.0;
+    const MAX_ZOOM = 10.0;
+    let placementZoom = 5.0;
+
+    function setPlacementZoom(val) {
+        placementZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(val * 10) / 10));
+        if (pathElements.placementZoomLabel) {
+            pathElements.placementZoomLabel.textContent = `Zoom: ${placementZoom.toFixed(1)}`;
+        }
+    }
+    setPlacementZoom(placementZoom);
+    
+    // Subject plane
+    const planeGeo = new THREE.PlaneGeometry(1.2, 1.2);
+    const planeMat = new THREE.MeshBasicMaterial({ 
+        color: 0x3a3a4a,
+        side: THREE.DoubleSide
+    });
+    const imagePlane = new THREE.Mesh(planeGeo, planeMat);
+    imagePlane.position.copy(CENTER);
+    scene.add(imagePlane);
+    
+    // Frame
+    const frameGeo = new THREE.EdgesGeometry(planeGeo);
+    const frameMat = new THREE.LineBasicMaterial({ color: 0xE93D82 });
+    const imageFrame = new THREE.LineSegments(frameGeo, frameMat);
+    imageFrame.position.copy(CENTER);
+    scene.add(imageFrame);
+    
+    // Clickable sphere (wireframe)
+    const sphereGeo = new THREE.SphereGeometry(SPHERE_RADIUS, 32, 24);
+    const sphereMat = new THREE.MeshBasicMaterial({ 
+        color: 0xE93D82, 
+        wireframe: true, 
+        transparent: true, 
+        opacity: 0.15 
+    });
+    const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+    sphere.position.copy(CENTER);
+    scene.add(sphere);
+    
+    // Waypoint markers group
+    const waypointMarkers = new THREE.Group();
+    scene.add(waypointMarkers);
+
+    // Ghost marker for preview (hover + scroll zoom)
+    const ghostMarkerGeo = new THREE.SphereGeometry(0.12, 16, 16);
+    const ghostMarkerMat = new THREE.MeshStandardMaterial({
+        color: 0xFFB800,
+        emissive: 0xFFB800,
+        emissiveIntensity: 0.6,
+        metalness: 0.2,
+        roughness: 0.5,
+        transparent: true,
+        opacity: 0.9
+    });
+    const ghostMarker = new THREE.Mesh(ghostMarkerGeo, ghostMarkerMat);
+    ghostMarker.visible = false;
+    scene.add(ghostMarker);
+
+    const ghostGlowGeo = new THREE.SphereGeometry(0.2, 16, 16);
+    const ghostGlowMat = new THREE.MeshBasicMaterial({
+        color: 0xFFB800,
+        transparent: true,
+        opacity: 0.2
+    });
+    const ghostGlow = new THREE.Mesh(ghostGlowGeo, ghostGlowMat);
+    ghostGlow.visible = false;
+    scene.add(ghostGlow);
+
+    let lastHoverDir = null; // THREE.Vector3
+    
+    // Path line
+    let pathLine = null;
+    
+    function updatePathLine() {
+        if (pathLine) {
+            scene.remove(pathLine);
+            pathLine = null;
+        }
+        
+        if (pathState.waypoints.length < 2) return;
+        
+        const points = pathState.waypoints.map(wp => {
+            const azRad = (wp.azimuth * Math.PI) / 180;
+            const elRad = (wp.elevation * Math.PI) / 180;
+            const dist = 2.0 - (wp.distance / 10) * 1.2;
+            return new THREE.Vector3(
+                dist * Math.sin(azRad) * Math.cos(elRad) + CENTER.x,
+                dist * Math.sin(elRad) + CENTER.y,
+                dist * Math.cos(azRad) * Math.cos(elRad) + CENTER.z
+            );
+        });
+        
+        const curve = new THREE.CatmullRomCurve3(points);
+        const tubeGeo = new THREE.TubeGeometry(curve, 64, 0.03, 8, false);
+        const tubeMat = new THREE.MeshBasicMaterial({ 
+            color: 0x00FFD0, 
+            transparent: true, 
+            opacity: 0.8 
+        });
+        pathLine = new THREE.Mesh(tubeGeo, tubeMat);
+        scene.add(pathLine);
+    }
+    
+    function updateWaypointMarkers() {
+        // Clear existing markers
+        while (waypointMarkers.children.length > 0) {
+            waypointMarkers.remove(waypointMarkers.children[0]);
+        }
+        
+        // Create markers for each waypoint
+        pathState.waypoints.forEach((wp, index) => {
+            const azRad = (wp.azimuth * Math.PI) / 180;
+            const elRad = (wp.elevation * Math.PI) / 180;
+            const dist = 2.0 - (wp.distance / 10) * 1.2;
+            
+            const x = dist * Math.sin(azRad) * Math.cos(elRad) + CENTER.x;
+            const y = dist * Math.sin(elRad) + CENTER.y;
+            const z = dist * Math.cos(azRad) * Math.cos(elRad) + CENTER.z;
+            
+            // Marker sphere
+            const markerGeo = new THREE.SphereGeometry(0.12, 16, 16);
+            const color = wp.generatedImageUrl ? 0x3DE9B4 : 0xE93D82;
+            const markerMat = new THREE.MeshStandardMaterial({ 
+                color: color,
+                emissive: color,
+                emissiveIntensity: 0.6,
+                metalness: 0.3,
+                roughness: 0.4
+            });
+            const marker = new THREE.Mesh(markerGeo, markerMat);
+            marker.position.set(x, y, z);
+            marker.userData = { waypointIndex: index };
+            waypointMarkers.add(marker);
+            
+            // Glow
+            const glowGeo = new THREE.SphereGeometry(0.18, 16, 16);
+            const glowMat = new THREE.MeshBasicMaterial({ 
+                color: color, 
+                transparent: true, 
+                opacity: 0.25 
+            });
+            const glow = new THREE.Mesh(glowGeo, glowMat);
+            glow.position.set(x, y, z);
+            waypointMarkers.add(glow);
+        });
+        
+        updatePathLine();
+    }
+    
+    // Raycaster for clicking
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    
+    function getMouse(event) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    function zoomToVisualDist(zoom) {
+        // Same mapping used in marker placement: higher zoom => closer
+        return 2.0 - (zoom / 10) * 1.2;
+    }
+
+    function updateGhostFromDir(dir) {
+        if (!dir) return;
+        const dist = zoomToVisualDist(placementZoom);
+        const pos = dir.clone().multiplyScalar(dist).add(CENTER);
+        ghostMarker.position.copy(pos);
+        ghostGlow.position.copy(pos);
+        ghostMarker.visible = true;
+        ghostGlow.visible = true;
+    }
+
+    function hideGhost() {
+        ghostMarker.visible = false;
+        ghostGlow.visible = false;
+        lastHoverDir = null;
+    }
+
+    function onPointerMove(event) {
+        getMouse(event);
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObject(sphere);
+        if (intersects.length > 0) {
+            const point = intersects[0].point;
+            const dir = point.clone().sub(CENTER).normalize();
+            lastHoverDir = dir;
+            updateGhostFromDir(dir);
+            renderer.domElement.style.cursor = 'crosshair';
+        } else {
+            renderer.domElement.style.cursor = 'default';
+            hideGhost();
+        }
+    }
+
+    function onWheel(event) {
+        // Scroll up => zoom in (higher zoom), scroll down => zoom out
+        if (!lastHoverDir) return;
+        event.preventDefault();
+        const delta = Math.sign(event.deltaY);
+        const step = 0.5;
+        setPlacementZoom(placementZoom + (delta > 0 ? -step : step));
+        updateGhostFromDir(lastHoverDir);
+    }
+
+    function onClick(event) {
+        getMouse(event);
+        raycaster.setFromCamera(mouse, camera);
+        
+        // Check if clicked on sphere
+        const intersects = raycaster.intersectObject(sphere);
+        if (intersects.length > 0 && pathState.waypoints.length < CONFIG.MAX_WAYPOINTS) {
+            const point = intersects[0].point;
+            
+            // Calculate angles from intersection point
+            const relX = point.x - CENTER.x;
+            const relY = point.y - CENTER.y;
+            const relZ = point.z - CENTER.z;
+            
+            let azimuth = Math.atan2(relX, relZ) * (180 / Math.PI);
+            if (azimuth < 0) azimuth += 360;
+            
+            const horizontalDist = Math.sqrt(relX * relX + relZ * relZ);
+            let elevation = Math.atan2(relY, horizontalDist) * (180 / Math.PI);
+            elevation = Math.max(-30, Math.min(90, elevation));
+            
+            // Add waypoint
+            const waypoint = {
+                id: `wp-${Date.now()}`,
+                azimuth: Math.round(azimuth),
+                elevation: Math.round(elevation),
+                distance: placementZoom,
+                generatedImageUrl: null
+            };
+            
+            pathState.waypoints.push(waypoint);
+            updateWaypointMarkers();
+            updateWaypointsList();
+            updatePathButtons();
+            addPathLog(`Added waypoint ${pathState.waypoints.length}: Az=${waypoint.azimuth}°, El=${waypoint.elevation}°`, 'info');
+        }
+    }
+    
+    renderer.domElement.addEventListener('mousemove', onPointerMove);
+    renderer.domElement.addEventListener('mouseleave', hideGhost);
+    renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
+    renderer.domElement.addEventListener('click', onClick);
+    renderer.domElement.style.cursor = 'crosshair';
+    
+    // Animation loop
+    function animate() {
+        requestAnimationFrame(animate);
+        renderer.render(scene, camera);
+    }
+    animate();
+    
+    // Resize
+    function onResize() {
+        const w = container.clientWidth;
+        const h = container.clientHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+    }
+    window.addEventListener('resize', onResize);
+    
+    // Public API
+    pathThreeScene = {
+        updateWaypoints: updateWaypointMarkers,
+        updateImage: (url) => {
+            if (url) {
+                const img = new Image();
+                if (!url.startsWith('data:')) img.crossOrigin = 'anonymous';
+                img.onload = () => {
+                    const tex = new THREE.Texture(img);
+                    tex.needsUpdate = true;
+                    tex.colorSpace = THREE.SRGBColorSpace;
+                    planeMat.map = tex;
+                    planeMat.color.set(0xffffff);
+                    planeMat.needsUpdate = true;
+                    
+                    const ar = img.width / img.height;
+                    const maxSize = 1.5;
+                    if (ar > 1) {
+                        imagePlane.scale.set(maxSize, maxSize / ar, 1);
+                        imageFrame.scale.set(maxSize, maxSize / ar, 1);
+                    } else {
+                        imagePlane.scale.set(maxSize * ar, maxSize, 1);
+                        imageFrame.scale.set(maxSize * ar, maxSize, 1);
+                    }
+                };
+                img.src = url;
+            } else {
+                planeMat.map = null;
+                planeMat.color.set(0x3a3a4a);
+                planeMat.needsUpdate = true;
+                imagePlane.scale.set(1, 1, 1);
+                imageFrame.scale.set(1, 1, 1);
+            }
+        }
+    };
+}
+
+// ===== Path Logging =====
+function addPathLog(message, type = 'info') {
+    const container = pathElements.logsContainer;
+    if (!container) return;
+    
+    const entry = document.createElement('div');
+    entry.className = `log-entry ${type}`;
+    
+    const timestamp = document.createElement('span');
+    timestamp.className = 'log-timestamp';
+    timestamp.textContent = `[${getTimestamp()}]`;
+    entry.appendChild(timestamp);
+    
+    let messageText = typeof message === 'object' ? JSON.stringify(message, null, 2) : message;
+    entry.appendChild(document.createTextNode(messageText));
+    container.appendChild(entry);
+    container.scrollTop = container.scrollHeight;
+}
+
+function showPathStatus(message, type = 'info') {
+    const el = pathElements.statusMessage;
+    if (!el) return;
+    el.textContent = message;
+    el.className = `status-message ${type}`;
+    el.classList.remove('hidden');
+    if (type === 'success') setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
+// Surface runtime errors into Path logs (helps debug “nothing happens”)
+window.addEventListener('error', (e) => {
+    try {
+        addPathLog(`JS Error: ${e.message}`, 'error');
+        if (e.filename) addPathLog(`at ${e.filename}:${e.lineno}:${e.colno}`, 'error');
+    } catch (_) {}
+});
+
+window.addEventListener('unhandledrejection', (e) => {
+    try {
+        addPathLog(`Unhandled Promise Rejection: ${formatError(e.reason)}`, 'error');
+    } catch (_) {}
+});
+
+// ===== Waypoints UI =====
+function updateWaypointsList() {
+    const list = pathElements.waypointsList;
+    const count = pathElements.waypointCount;
+    if (!list) return;
+    
+    count.textContent = `(${pathState.waypoints.length}/${CONFIG.MAX_WAYPOINTS})`;
+    
+    if (pathState.waypoints.length === 0) {
+        list.innerHTML = `<div class="waypoints-empty"><p>Click on the sphere above to add camera positions</p></div>`;
+        return;
+    }
+    
+    list.innerHTML = pathState.waypoints.map((wp, i) => `
+        <div class="waypoint-item ${wp.generatedImageUrl ? 'completed' : ''}" data-index="${i}">
+            <div class="waypoint-number">${i + 1}</div>
+            <div class="waypoint-info">
+                Az: <span>${wp.azimuth}°</span> | El: <span>${wp.elevation}°</span> | Zoom: <span>${wp.distance}</span>
+            </div>
+            <div class="waypoint-actions">
+                <button class="waypoint-action-btn delete" data-action="delete" data-index="${i}" title="Delete">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M18 6L6 18M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    `).join('');
+    
+    // Add delete handlers
+    list.querySelectorAll('[data-action="delete"]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const index = parseInt(btn.dataset.index);
+            pathState.waypoints.splice(index, 1);
+            if (pathThreeScene) pathThreeScene.updateWaypoints();
+            updateWaypointsList();
+            updatePathButtons();
+            addPathLog(`Removed waypoint ${index + 1}`, 'info');
+        });
+    });
+}
+
+function updatePathButtons() {
+    const hasImage = pathState.uploadedImage || pathState.imageUrl;
+    const hasApiKey = elements.apiKey?.value.trim().length > 0;
+    const hasEnoughWaypoints = pathState.waypoints.length >= CONFIG.MIN_WAYPOINTS;
+    
+    if (pathElements.generateKeyframesBtn) {
+        pathElements.generateKeyframesBtn.disabled = !hasImage || !hasApiKey || !hasEnoughWaypoints || pathState.isGeneratingKeyframes;
+    }
+    
+    const allKeyframesGenerated = pathState.waypoints.length >= 2 && pathState.waypoints.every(wp => wp.generatedImageUrl);
+    if (pathElements.generateVideoBtn) {
+        pathElements.generateVideoBtn.disabled = !allKeyframesGenerated || !hasApiKey || pathState.isGeneratingVideos;
+    }
+    
+    if (pathElements.downloadAllBtn) {
+        pathElements.downloadAllBtn.classList.toggle('hidden', !allKeyframesGenerated);
+    }
+}
+
+// ===== Path Image Upload =====
+function handlePathImageUpload(file) {
+    const validation = validateImageFile(file);
+    if (!validation.valid) {
+        showPathStatus(validation.error, 'error');
+        return;
+    }
+    
+    addPathLog(`Uploading: ${file.name}`, 'info');
+    pathState.imageUrl = null;
+    
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        pathState.uploadedImage = file;
+        pathState.uploadedImageBase64 = e.target.result;
+        
+        pathElements.previewImage.src = e.target.result;
+        pathElements.previewImage.classList.remove('hidden');
+        pathElements.uploadPlaceholder.classList.add('hidden');
+        pathElements.clearImage.classList.remove('hidden');
+        pathElements.uploadZone.classList.add('has-image');
+        
+        if (pathThreeScene) pathThreeScene.updateImage(e.target.result);
+        updatePathButtons();
+    };
+    reader.readAsDataURL(file);
+}
+
+function clearPathImage() {
+    pathState.uploadedImage = null;
+    pathState.uploadedImageBase64 = null;
+    pathState.imageUrl = null;
+    
+    pathElements.previewImage.src = '';
+    pathElements.previewImage.classList.add('hidden');
+    pathElements.uploadPlaceholder.classList.remove('hidden');
+    pathElements.clearImage.classList.add('hidden');
+    pathElements.uploadZone.classList.remove('has-image');
+    pathElements.imageUrlInput.value = '';
+    
+    if (pathThreeScene) pathThreeScene.updateImage(null);
+    updatePathButtons();
+}
+
+function loadPathImageFromUrl(url) {
+    const validation = validateImageUrl(url);
+    if (!validation.valid) {
+        showPathStatus(validation.error, 'error');
+        return;
+    }
+    
+    url = url.trim();
+    addPathLog(`Loading URL: ${url}`, 'info');
+    
+    pathState.uploadedImage = null;
+    pathState.uploadedImageBase64 = null;
+    pathState.imageUrl = url;
+    
+    pathElements.clearImage.classList.remove('hidden');
+    pathElements.uploadZone.classList.add('has-image');
+    
+    const img = new Image();
+    img.onload = () => {
+        pathElements.previewImage.src = url;
+        pathElements.previewImage.classList.remove('hidden');
+        pathElements.uploadPlaceholder.classList.add('hidden');
+    };
+    img.src = url;
+    
+    if (pathThreeScene) pathThreeScene.updateImage(url);
+    updatePathButtons();
+}
+
+// ===== Generate Keyframes =====
+async function generateKeyframes() {
+    const apiKey = elements.apiKey.value.trim();
+    addPathLog(`Generate keyframes clicked. waypoints=${pathState.waypoints.length}, hasApiKey=${apiKey.length > 0}, hasPathImage=${!!(pathState.imageUrl || pathState.uploadedImage)}`, 'info');
+    if (!apiKey) {
+        showPathStatus('Please enter your fal.ai API key', 'error');
+        return;
+    }
+
+    // If user uploaded only in Single Angle tab, auto-sync it now
+    if (!pathState.imageUrl && !pathState.uploadedImage) {
+        syncPathImageFromSingleAngle();
+    }
+    
+    if (pathState.waypoints.length < CONFIG.MIN_WAYPOINTS) {
+        showPathStatus(`Add at least ${CONFIG.MIN_WAYPOINTS} waypoints`, 'error');
+        return;
+    }
+
+    if (!pathState.imageUrl && !pathState.uploadedImage) {
+        showPathStatus('Please upload an image (in Camera Path tab) or switch from Single Angle with an image loaded', 'error');
+        addPathLog('Keyframe generation blocked: no image found for Camera Path', 'error');
+        return;
+    }
+    
+    pathState.isGeneratingKeyframes = true;
+    updatePathButtons();
+
+    showPathStatus('Generating keyframes...', 'info');
+    // Render placeholder slots immediately (one per waypoint)
+    updateGallery();
+    
+    pathElements.generateKeyframesBtn.classList.add('generating');
+    pathElements.generateKeyframesBtn.querySelector('.btn-text').textContent = 'Generating...';
+    pathElements.generateKeyframesBtn.querySelector('.btn-loader').classList.remove('hidden');
+    pathElements.keyframeProgress.classList.remove('hidden');
+    pathElements.keyframeProgressFill.style.width = '0%';
+    pathElements.keyframeProgressText.textContent = `0/${pathState.waypoints.length}`;
+    
+    fal.config({ credentials: apiKey });
+    
+    let imageUrl;
+    try {
+        if (pathState.imageUrl) {
+            imageUrl = pathState.imageUrl;
+        } else {
+            addPathLog('Uploading source image...', 'request');
+            imageUrl = await fal.storage.upload(pathState.uploadedImage);
+            addPathLog(`Uploaded: ${imageUrl}`, 'response');
+        }
+    } catch (err) {
+        showPathStatus('Failed to upload image', 'error');
+        addPathLog(`Upload error: ${formatError(err)}`, 'error');
+        pathState.isGeneratingKeyframes = false;
+        resetKeyframeUI();
+        return;
+    }
+    
+    const total = pathState.waypoints.length;
+    let completed = 0;
+    
+    for (let i = 0; i < pathState.waypoints.length; i++) {
+        const wp = pathState.waypoints[i];
+        
+        pathElements.keyframeProgressFill.style.width = `${(i / total) * 100}%`;
+        pathElements.keyframeProgressText.textContent = `${i + 1}/${total}`;
+        
+        addPathLog(`Generating keyframe ${i + 1}/${total}: Az=${wp.azimuth}°, El=${wp.elevation}°`, 'request');
+        
+        try {
+            const result = await fal.run(CONFIG.FAL_MODEL_ID, {
+                input: {
+                    image_urls: [imageUrl],
+                    horizontal_angle: wp.azimuth,
+                    vertical_angle: wp.elevation,
+                    zoom: wp.distance
+                }
+            });
+            
+            const data = result.data || result;
+            const outputUrl = data?.images?.[0]?.url || result?.images?.[0]?.url;
+            
+            if (outputUrl) {
+                wp.generatedImageUrl = outputUrl;
+                completed++;
+                addPathLog(`Keyframe ${i + 1} done: ${outputUrl.substring(0, 50)}...`, 'response');
+            } else {
+                addPathLog(`Keyframe ${i + 1} failed: no image in response`, 'error');
+            }
+        } catch (err) {
+            addPathLog(`Keyframe ${i + 1} error: ${formatError(err)}`, 'error');
+        }
+        
+        if (pathThreeScene) pathThreeScene.updateWaypoints();
+        updateWaypointsList();
+        updateGallery();
+    }
+    
+    pathElements.keyframeProgressFill.style.width = '100%';
+    pathElements.keyframeProgressText.textContent = `${completed}/${total}`;
+    
+    pathState.isGeneratingKeyframes = false;
+    resetKeyframeUI();
+    updatePathButtons();
+    
+    if (completed === total) {
+        showPathStatus('All keyframes generated!', 'success');
+    } else {
+        showPathStatus(`Generated ${completed}/${total} keyframes`, 'warn');
+    }
+}
+
+function resetKeyframeUI() {
+    pathElements.generateKeyframesBtn.classList.remove('generating');
+    pathElements.generateKeyframesBtn.querySelector('.btn-text').textContent = 'Generate All Keyframes';
+    pathElements.generateKeyframesBtn.querySelector('.btn-loader').classList.add('hidden');
+}
+
+// ===== Gallery =====
+function updateGallery() {
+    const gallery = pathElements.gallery;
+    if (!gallery) return;
+    
+    const generatedWaypoints = pathState.waypoints.filter(wp => wp.generatedImageUrl);
+    
+    // If we're generating (or have at least one result), render placeholders for every waypoint
+    // so the user sees N slots immediately.
+    if (pathState.waypoints.length > 0 && (pathState.isGeneratingKeyframes || generatedWaypoints.length > 0)) {
+        gallery.innerHTML = pathState.waypoints.map((wp, i) => {
+            if (!wp.generatedImageUrl) {
+                return `
+                    <div class="gallery-item">
+                        <div class="gallery-item-loading">
+                            <svg class="spinner" viewBox="0 0 24 24">
+                                <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="31.4" stroke-dashoffset="10"/>
+                            </svg>
+                        </div>
+                    </div>
+                `;
+            }
+            return `
+                <div class="gallery-item">
+                    <img src="${wp.generatedImageUrl}" alt="Keyframe ${i + 1}">
+                    <div class="gallery-item-overlay">
+                        <span class="gallery-item-label">Keyframe ${i + 1}</span>
+                        <button class="gallery-item-download" data-url="${wp.generatedImageUrl}" data-index="${i}">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                                <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        // Add download handlers (only applies to generated ones)
+        gallery.querySelectorAll('.gallery-item-download').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const url = btn.dataset.url;
+                const index = btn.dataset.index;
+                try {
+                    const response = await fetch(url);
+                    const blob = await response.blob();
+                    const blobUrl = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = blobUrl;
+                    a.download = `keyframe-${parseInt(index) + 1}.png`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(blobUrl);
+                } catch (err) {
+                    window.open(url, '_blank');
+                }
+            });
+        });
+
+        return;
+    }
+
+    if (generatedWaypoints.length === 0) {
+        gallery.innerHTML = `
+            <div class="gallery-empty">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                    <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+                </svg>
+                <p>Generated keyframes will appear here</p>
+            </div>
+        `;
+        return;
+    }
+}
+
+// ===== Download All as ZIP =====
+async function downloadAllAsZip() {
+    const generated = pathState.waypoints.filter(wp => wp.generatedImageUrl);
+    if (generated.length === 0) return;
+    
+    addPathLog('Creating ZIP file...', 'info');
+    showPathStatus('Preparing download...', 'info');
+    
+    try {
+        const zip = new JSZip();
+        
+        for (let i = 0; i < pathState.waypoints.length; i++) {
+            const wp = pathState.waypoints[i];
+            if (!wp.generatedImageUrl) continue;
+            
+            const response = await fetch(wp.generatedImageUrl);
+            const blob = await response.blob();
+            zip.file(`keyframe-${i + 1}.png`, blob);
+        }
+        
+        const content = await zip.generateAsync({ type: 'blob' });
+        const url = window.URL.createObjectURL(content);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `camera-path-keyframes-${Date.now()}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+        
+        showPathStatus('Downloaded!', 'success');
+        addPathLog('ZIP download complete', 'info');
+    } catch (err) {
+        showPathStatus('Download failed', 'error');
+        addPathLog(`ZIP error: ${formatError(err)}`, 'error');
+    }
+}
+
+// ===== Easing Functions =====
+const easings = {
+    'linear': t => t,
+    'ease-in-out': t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2,
+    'ease-out': t => 1 - Math.pow(1 - t, 3),
+    'bounce': t => {
+        const n1 = 7.5625;
+        const d1 = 2.75;
+        if (t < 1 / d1) return n1 * t * t;
+        if (t < 2 / d1) return n1 * (t -= 1.5 / d1) * t + 0.75;
+        if (t < 2.5 / d1) return n1 * (t -= 2.25 / d1) * t + 0.9375;
+        return n1 * (t -= 2.625 / d1) * t + 0.984375;
+    }
+};
+
+// ===== Generate Transition Video =====
+async function generateTransitionVideo() {
+    const keyframes = pathState.waypoints.filter(wp => wp.generatedImageUrl);
+    if (keyframes.length < 2) {
+        showPathStatus('Need at least 2 generated keyframes', 'error');
+        return;
+    }
+    
+    pathState.isGeneratingVideos = true;
+    updatePathButtons();
+    
+    pathElements.generateVideoBtn.classList.add('generating');
+    pathElements.generateVideoBtn.querySelector('.btn-text').textContent = 'Rendering...';
+    pathElements.generateVideoBtn.querySelector('.btn-loader').classList.remove('hidden');
+    pathElements.videoProgress.classList.remove('hidden');
+    
+    const totalDuration = parseInt(pathElements.videoDuration?.value || '5') * 1000;
+    const fps = parseInt(pathElements.videoFps?.value || '30');
+    const transitionStyle = pathElements.transitionStyle?.value || 'crane-zoom';
+    const easeType = pathElements.easeType?.value || 'ease-in-out';
+    const ease = easings[easeType] || easings['ease-in-out'];
+    
+    addPathLog(`Creating ${totalDuration/1000}s video at ${fps}fps with ${transitionStyle} transitions`, 'info');
+    addPathLog(`Rendering in real-time (will take ~${totalDuration/1000}s)...`, 'info');
+    
+    const canvas = pathElements.videoCanvas;
+    const ctx = canvas.getContext('2d');
+    
+    // Set canvas size (720p)
+    canvas.width = 1280;
+    canvas.height = 720;
+    
+    // Load all images first
+    const images = [];
+    for (const wp of keyframes) {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = reject;
+            img.src = wp.generatedImageUrl;
+        });
+        images.push(img);
+    }
+    
+    addPathLog(`Loaded ${images.length} keyframe images`, 'info');
+    
+    // Calculate transition parameters based on angle changes
+    const transitions = [];
+    for (let i = 0; i < keyframes.length - 1; i++) {
+        const from = keyframes[i];
+        const to = keyframes[i + 1];
+        const azDiff = to.azimuth - from.azimuth;
+        const elDiff = to.elevation - from.elevation;
+        const zoomDiff = to.distance - from.distance;
+        
+        transitions.push({
+            fromImg: images[i],
+            toImg: images[i + 1],
+            azDiff,
+            elDiff,
+            zoomDiff,
+            // Direction for pan/zoom
+            panX: azDiff > 0 ? 1 : -1,
+            panY: elDiff > 0 ? -1 : 1,
+            zoomDir: zoomDiff > 0 ? 1 : -1
+        });
+    }
+    
+    const totalFrames = Math.floor(totalDuration / 1000 * fps);
+    const framesPerTransition = Math.floor(totalFrames / transitions.length);
+    
+    // Setup MediaRecorder
+    const stream = canvas.captureStream(fps);
+    const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'video/webm;codecs=vp9',
+        videoBitsPerSecond: 8000000
+    });
+    
+    const chunks = [];
+    mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+    
+    const videoPromise = new Promise((resolve) => {
+        mediaRecorder.onstop = () => {
+            const blob = new Blob(chunks, { type: 'video/webm' });
+            resolve(blob);
+        };
+    });
+    
+    mediaRecorder.start();
+    
+    // Frame timing - must match real-time for MediaRecorder
+    const frameInterval = 1000 / fps;
+    
+    // Render frames
+    let currentFrame = 0;
+    
+    for (let t = 0; t < transitions.length; t++) {
+        const trans = transitions[t];
+        
+        for (let f = 0; f < framesPerTransition; f++) {
+            const frameStart = performance.now();
+            const progress = f / framesPerTransition;
+            const easedProgress = ease(progress);
+            
+            // Update progress UI
+            const overallProgress = (currentFrame / totalFrames) * 100;
+            pathElements.videoProgressFill.style.width = `${overallProgress}%`;
+            pathElements.videoProgressText.textContent = `Frame ${currentFrame}/${totalFrames}`;
+            
+            // Clear canvas
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Apply transition effect
+            if (transitionStyle === 'crane-zoom') {
+                // Crane zoom: zoom out from current, zoom in to next with pan
+                const zoomOut = 1 + easedProgress * 0.3;
+                const zoomIn = 1.3 - easedProgress * 0.3;
+                const panOffset = easedProgress * 100 * trans.panX;
+                
+                // Draw "from" image (zooming out, fading)
+                ctx.globalAlpha = 1 - easedProgress;
+                drawImageZoomed(ctx, trans.fromImg, canvas.width, canvas.height, zoomOut, panOffset, 0);
+                
+                // Draw "to" image (zooming in, appearing)
+                ctx.globalAlpha = easedProgress;
+                drawImageZoomed(ctx, trans.toImg, canvas.width, canvas.height, zoomIn, -panOffset, 0);
+                
+            } else if (transitionStyle === 'smooth-pan') {
+                // Smooth pan: slide images
+                const slideX = easedProgress * canvas.width * trans.panX;
+                
+                ctx.globalAlpha = 1;
+                drawImageZoomed(ctx, trans.fromImg, canvas.width, canvas.height, 1, -slideX, 0);
+                drawImageZoomed(ctx, trans.toImg, canvas.width, canvas.height, 1, canvas.width - slideX, 0);
+                
+            } else if (transitionStyle === 'whip-pan') {
+                // Whip pan: fast motion blur effect
+                const speed = Math.sin(easedProgress * Math.PI) * 50;
+                const blur = Math.abs(speed) > 20 ? 0.7 : 1;
+                
+                ctx.globalAlpha = blur;
+                if (easedProgress < 0.5) {
+                    drawImageZoomed(ctx, trans.fromImg, canvas.width, canvas.height, 1, -speed * 3, 0);
+                } else {
+                    drawImageZoomed(ctx, trans.toImg, canvas.width, canvas.height, 1, speed * 3, 0);
+                }
+                
+            } else if (transitionStyle === 'dolly-zoom') {
+                // Dolly zoom: opposite zoom directions
+                const zoom1 = 1 + easedProgress * 0.5;
+                const zoom2 = 1.5 - easedProgress * 0.5;
+                
+                ctx.globalAlpha = 1 - easedProgress;
+                drawImageZoomed(ctx, trans.fromImg, canvas.width, canvas.height, zoom1, 0, 0);
+                
+                ctx.globalAlpha = easedProgress;
+                drawImageZoomed(ctx, trans.toImg, canvas.width, canvas.height, zoom2, 0, 0);
+            }
+            
+            ctx.globalAlpha = 1;
+            currentFrame++;
+            
+            // Wait for proper frame timing (real-time for MediaRecorder)
+            const elapsed = performance.now() - frameStart;
+            const waitTime = Math.max(1, frameInterval - elapsed);
+            await new Promise(r => setTimeout(r, waitTime));
+        }
+    }
+    
+    // Hold on last frame for 0.5 seconds
+    const holdFrames = Math.floor(fps * 0.5);
+    for (let i = 0; i < holdFrames; i++) {
+        const frameStart = performance.now();
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        drawImageZoomed(ctx, images[images.length - 1], canvas.width, canvas.height, 1, 0, 0);
+        
+        const elapsed = performance.now() - frameStart;
+        const waitTime = Math.max(1, frameInterval - elapsed);
+        await new Promise(r => setTimeout(r, waitTime));
+    }
+    
+    mediaRecorder.stop();
+    
+    const videoBlob = await videoPromise;
+    const videoUrl = URL.createObjectURL(videoBlob);
+    
+    pathState.generatedVideoUrl = videoUrl;
+    pathState.generatedVideoBlob = videoBlob;
+    
+    // Show video
+    pathElements.finalVideo.src = videoUrl;
+    pathElements.finalVideo.classList.remove('hidden');
+    pathElements.videoEmptyState.classList.add('hidden');
+    pathElements.downloadVideoBtn.classList.remove('hidden');
+    
+    pathElements.videoProgressFill.style.width = '100%';
+    pathElements.videoProgressText.textContent = 'Complete!';
+    
+    pathState.isGeneratingVideos = false;
+    pathElements.generateVideoBtn.classList.remove('generating');
+    pathElements.generateVideoBtn.querySelector('.btn-text').textContent = 'Create Video';
+    pathElements.generateVideoBtn.querySelector('.btn-loader').classList.add('hidden');
+    updatePathButtons();
+    
+    showPathStatus('Video created!', 'success');
+    addPathLog('Video rendering complete', 'response');
+}
+
+// Helper: Draw image with zoom and offset
+function drawImageZoomed(ctx, img, canvasW, canvasH, zoom, offsetX, offsetY) {
+    const imgAspect = img.width / img.height;
+    const canvasAspect = canvasW / canvasH;
+    
+    let drawW, drawH;
+    if (imgAspect > canvasAspect) {
+        drawH = canvasH * zoom;
+        drawW = drawH * imgAspect;
+    } else {
+        drawW = canvasW * zoom;
+        drawH = drawW / imgAspect;
+    }
+    
+    const x = (canvasW - drawW) / 2 + offsetX;
+    const y = (canvasH - drawH) / 2 + offsetY;
+    
+    ctx.drawImage(img, x, y, drawW, drawH);
+}
+
+// ===== Generate AI Video (Seedance) =====
+// Generates video for EACH consecutive keyframe pair, speeds up 4x, stitches together
+async function generateAIVideo() {
+    const apiKey = elements.apiKey.value.trim();
+    if (!apiKey) {
+        showPathStatus('Please enter your fal.ai API key', 'error');
+        return;
+    }
+    
+    const keyframes = pathState.waypoints.filter(wp => wp.generatedImageUrl);
+    if (keyframes.length < 2) {
+        showPathStatus('Need at least 2 generated keyframes', 'error');
+        return;
+    }
+    
+    pathState.isGeneratingVideos = true;
+    pathState.segmentVideos = [];
+    updatePathButtons();
+    
+    pathElements.generateVideoBtn.classList.add('generating');
+    pathElements.generateVideoBtn.querySelector('.btn-text').textContent = 'Generating segments...';
+    pathElements.generateVideoBtn.querySelector('.btn-loader').classList.remove('hidden');
+    pathElements.videoProgress.classList.remove('hidden');
+    
+    const prompt = pathElements.aiPrompt?.value || 'The camera very slowly and smoothly lowers on a boom. The subject moves barely moves, and is extremely deliberate and thoughtful in his movement.';
+    const resolution = pathElements.aiResolution?.value || '720p';
+    const pairSeconds = parseFloat(pathElements.aiPairSeconds?.value || '1');
+    const seedanceSegmentSeconds = 4; // API minimum
+    const speedMultiplier = seedanceSegmentSeconds / Math.max(0.5, pairSeconds);
+    const totalSegments = keyframes.length - 1;
+    
+    fal.config({ credentials: apiKey });
+    
+    addPathLog(`Generating ${totalSegments} Seedance segments (${seedanceSegmentSeconds}s each → ${pairSeconds}s after speedup, ${speedMultiplier.toFixed(2)}x)`, 'info');
+    addPathLog(`Prompt: "${prompt}"`, 'info');
+    
+    // Step 1: Generate all Seedance segments
+    const segmentUrls = [];
+    for (let i = 0; i < totalSegments; i++) {
+        const startFrame = keyframes[i];
+        const endFrame = keyframes[i + 1];
+        
+        pathElements.videoProgressFill.style.width = `${((i + 0.5) / totalSegments) * 70}%`;
+        pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments}`;
+        
+        addPathLog(`Segment ${i + 1}: Frame ${i + 1} (Az=${startFrame.azimuth}°) → Frame ${i + 2} (Az=${endFrame.azimuth}°)`, 'request');
+        
+        try {
+            const result = await fal.subscribe(CONFIG.SEEDANCE_MODEL_ID, {
+                input: {
+                    prompt: prompt,
+                    image_url: startFrame.generatedImageUrl,
+                    end_image_url: endFrame.generatedImageUrl,
+                    duration: String(seedanceSegmentSeconds), // API minimum; we speed up in stitching
+                    resolution: resolution,
+                    camera_fixed: false,
+                    generate_audio: false
+                },
+                logs: false,
+                onQueueUpdate: (update) => {
+                    if (update.status === 'IN_QUEUE') {
+                        pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments} (queued)`;
+                    } else if (update.status === 'IN_PROGRESS') {
+                        pathElements.videoProgressText.textContent = `Segment ${i + 1}/${totalSegments} (rendering)`;
+                    }
+                }
+            });
+            
+            const videoUrl = result?.data?.video?.url || result?.video?.url;
+            if (videoUrl) {
+                segmentUrls.push(videoUrl);
+                addPathLog(`Segment ${i + 1} done!`, 'response');
+            } else {
+                addPathLog(`Segment ${i + 1}: No video in response`, 'error');
+            }
+        } catch (err) {
+            addPathLog(`Segment ${i + 1} failed: ${formatError(err)}`, 'error');
+        }
+    }
+    
+    if (segmentUrls.length === 0) {
+        showPathStatus('No segments generated', 'error');
+        resetVideoUI();
+        return;
+    }
+    
+    // Step 2: Download, speed up 4x, and stitch
+    pathElements.videoProgressFill.style.width = '75%';
+    pathElements.videoProgressText.textContent = 'Downloading segments...';
+    addPathLog(`Downloading ${segmentUrls.length} segments for stitching...`, 'info');
+    
+    try {
+        // Download all video blobs
+        const videoBlobs = [];
+        for (let i = 0; i < segmentUrls.length; i++) {
+            const response = await fetch(segmentUrls[i]);
+            const blob = await response.blob();
+            videoBlobs.push(blob);
+            addPathLog(`Downloaded segment ${i + 1}`, 'info');
+        }
+        
+        pathElements.videoProgressText.textContent = 'Stitching with 4x speedup...';
+        pathElements.videoProgressFill.style.width = '85%';
+        
+        // Stitch with speedup
+        const finalBlob = await stitchAndSpeedupVideos(videoBlobs, speedMultiplier);
+        
+        pathState.generatedVideoBlob = finalBlob;
+        pathState.generatedVideoUrl = URL.createObjectURL(finalBlob);
+        
+        pathElements.finalVideo.src = pathState.generatedVideoUrl;
+        pathElements.finalVideo.classList.remove('hidden');
+        pathElements.videoEmptyState.classList.add('hidden');
+        pathElements.downloadVideoBtn.classList.remove('hidden');
+        
+        pathElements.videoProgressFill.style.width = '100%';
+        pathElements.videoProgressText.textContent = 'Complete!';
+        
+        const finalDuration = segmentUrls.length * pairSeconds;
+        showPathStatus(`Done! ${finalDuration} second video`, 'success');
+        addPathLog(`Final video: ~${finalDuration} seconds (${segmentUrls.length} segments × ${pairSeconds}s)`, 'response');
+        
+    } catch (err) {
+        addPathLog(`Stitch error: ${formatError(err)}`, 'error');
+        showPathStatus('Stitching failed - showing segments', 'warn');
+        
+        // Fallback: show first segment
+        if (segmentUrls.length > 0) {
+            pathState.generatedVideoUrl = segmentUrls[0];
+            pathElements.finalVideo.src = segmentUrls[0];
+            pathElements.finalVideo.classList.remove('hidden');
+            pathElements.videoEmptyState.classList.add('hidden');
+            pathElements.downloadVideoBtn.classList.remove('hidden');
+        }
+    }
+    
+    resetVideoUI();
+}
+
+function resetVideoUI() {
+    pathState.isGeneratingVideos = false;
+    pathElements.generateVideoBtn.classList.remove('generating');
+    pathElements.generateVideoBtn.querySelector('.btn-text').textContent = 'Create Video';
+    pathElements.generateVideoBtn.querySelector('.btn-loader').classList.add('hidden');
+    updatePathButtons();
+}
+
+// Stitch video blobs with speedup - extracts frames and re-encodes
+async function stitchAndSpeedupVideos(videoBlobs, speedMultiplier) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280;
+    canvas.height = 720;
+    const ctx = canvas.getContext('2d');
+    
+    // Collect all frames first (not real-time)
+    const allFrames = [];
+    const fps = 30;
+    
+    for (let i = 0; i < videoBlobs.length; i++) {
+        addPathLog(`Extracting frames from segment ${i + 1}...`, 'info');
+        
+        const video = document.createElement('video');
+        video.muted = true;
+        video.playsInline = true;
+        video.src = URL.createObjectURL(videoBlobs[i]);
+        
+        await new Promise(r => { video.onloadedmetadata = r; });
+        
+        const duration = video.duration;
+        const outputFrameCount = Math.floor((duration / speedMultiplier) * fps);
+        
+        for (let f = 0; f < outputFrameCount; f++) {
+            const seekTime = (f / outputFrameCount) * duration;
+            video.currentTime = seekTime;
+            await new Promise(r => { video.onseeked = r; });
+            
+            // Capture frame to ImageData
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            allFrames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+        }
+        
+        URL.revokeObjectURL(video.src);
+    }
+    
+    addPathLog(`Encoding ${allFrames.length} frames...`, 'info');
+    
+    // Now encode all frames (fast, not real-time)
+    const stream = canvas.captureStream(fps);
+    const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'video/webm;codecs=vp9',
+        videoBitsPerSecond: 8000000
+    });
+    
+    const chunks = [];
+    mediaRecorder.ondataavailable = e => chunks.push(e.data);
+    
+    return new Promise((resolve) => {
+        mediaRecorder.onstop = () => {
+            resolve(new Blob(chunks, { type: 'video/webm' }));
+        };
+        
+        mediaRecorder.start();
+        
+        let frameIndex = 0;
+        const frameInterval = 1000 / fps;
+        
+        function drawNextFrame() {
+            if (frameIndex < allFrames.length) {
+                ctx.putImageData(allFrames[frameIndex], 0, 0);
+                frameIndex++;
+                setTimeout(drawNextFrame, frameInterval);
+            } else {
+                // Add small delay then stop
+                setTimeout(() => mediaRecorder.stop(), 100);
+            }
+        }
+        
+        drawNextFrame();
+    });
+}
+
+// ===== Video Mode Toggle =====
+function setupVideoModeToggle() {
+    const modeBtns = document.querySelectorAll('.mode-btn');
+    const quickSettings = document.getElementById('quick-settings');
+    const aiSettings = document.getElementById('ai-settings');
+    
+    modeBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const mode = btn.dataset.mode;
+            pathState.videoMode = mode;
+            
+            // Update buttons
+            modeBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            
+            // Update settings visibility
+            if (mode === 'quick') {
+                quickSettings.classList.remove('hidden');
+                aiSettings.classList.add('hidden');
+            } else {
+                quickSettings.classList.add('hidden');
+                aiSettings.classList.remove('hidden');
+            }
+        });
+    });
+}
+
+// ===== Generate Video (routes to correct function) =====
+function generateVideo() {
+    if (pathState.videoMode === 'ai') {
+        generateAIVideo();
+    } else {
+        generateTransitionVideo();
+    }
+}
+
+// Download video
+async function downloadVideo() {
+    // For quick stitch (blob)
+    if (pathState.generatedVideoBlob) {
+        const url = URL.createObjectURL(pathState.generatedVideoBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `camera-path-video-${Date.now()}.webm`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        addPathLog('Video downloaded', 'info');
+        return;
+    }
+    
+    // For AI video (URL)
+    if (pathState.generatedVideoUrl) {
+        try {
+            addPathLog('Downloading video...', 'info');
+            const response = await fetch(pathState.generatedVideoUrl);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `camera-path-ai-video-${Date.now()}.mp4`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            addPathLog('Video downloaded', 'info');
+        } catch (err) {
+            // Fallback: open in new tab
+            window.open(pathState.generatedVideoUrl, '_blank');
+        }
+    }
+}
+
+// ===== Setup Path Event Listeners =====
+function setupPathEventListeners() {
+    // Upload zone click
+    pathElements.uploadZone?.addEventListener('click', () => pathElements.imageInput.click());
+    
+    pathElements.imageInput?.addEventListener('change', (e) => {
+        if (e.target.files?.[0]) handlePathImageUpload(e.target.files[0]);
+    });
+    
+    // Drag and drop
+    pathElements.uploadZone?.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        pathElements.uploadZone.classList.add('drag-over');
+    });
+    
+    pathElements.uploadZone?.addEventListener('dragleave', () => {
+        pathElements.uploadZone.classList.remove('drag-over');
+    });
+    
+    pathElements.uploadZone?.addEventListener('drop', (e) => {
+        e.preventDefault();
+        pathElements.uploadZone.classList.remove('drag-over');
+        if (e.dataTransfer.files?.[0]) handlePathImageUpload(e.dataTransfer.files[0]);
+    });
+    
+    // Clear image
+    pathElements.clearImage?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        clearPathImage();
+    });
+    
+    // URL input
+    pathElements.loadUrlBtn?.addEventListener('click', () => {
+        loadPathImageFromUrl(pathElements.imageUrlInput.value);
+    });
+    
+    pathElements.imageUrlInput?.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') loadPathImageFromUrl(pathElements.imageUrlInput.value);
+    });
+    
+    // Clear waypoints
+    pathElements.clearWaypointsBtn?.addEventListener('click', () => {
+        pathState.waypoints = [];
+        if (pathThreeScene) pathThreeScene.updateWaypoints();
+        updateWaypointsList();
+        updatePathButtons();
+        updateGallery();
+        addPathLog('Cleared all waypoints', 'info');
+    });
+    
+    // Undo waypoint
+    pathElements.undoWaypointBtn?.addEventListener('click', () => {
+        if (pathState.waypoints.length > 0) {
+            pathState.waypoints.pop();
+            if (pathThreeScene) pathThreeScene.updateWaypoints();
+            updateWaypointsList();
+            updatePathButtons();
+            addPathLog('Removed last waypoint', 'info');
+        }
+    });
+    
+    // Generate keyframes
+    pathElements.generateKeyframesBtn?.addEventListener('click', generateKeyframes);
+    
+    // Download all
+    pathElements.downloadAllBtn?.addEventListener('click', downloadAllAsZip);
+    
+    // Generate video
+    pathElements.generateVideoBtn?.addEventListener('click', generateVideo);
+    
+    // Setup video mode toggle
+    setupVideoModeToggle();
+    
+    // Download video
+    pathElements.downloadVideoBtn?.addEventListener('click', downloadVideo);
+    
+    // Clear logs
+    pathElements.clearLogsBtn?.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (pathElements.logsContainer) {
+            pathElements.logsContainer.innerHTML = '<div class="log-entry info">Logs cleared.</div>';
+        }
+    });
+    
+    // API key changes should update path buttons too
+    elements.apiKey?.addEventListener('input', updatePathButtons);
+}
+
 // ===== Initialize =====
 function init() {
-    // Cache DOM elements
+    // Cache DOM elements - Single Angle Tab
     elements.apiKey = document.getElementById('api-key');
     elements.toggleKey = document.getElementById('toggle-key');
     elements.uploadZone = document.getElementById('upload-zone');
@@ -1246,18 +2810,68 @@ function init() {
     elements.logsContainer = document.getElementById('logs-container');
     elements.clearLogs = document.getElementById('clear-logs');
     
-    // Initialize
+    // Cache DOM elements - Camera Path Tab
+    pathElements.uploadZone = document.getElementById('path-upload-zone');
+    pathElements.imageInput = document.getElementById('path-image-input');
+    pathElements.uploadPlaceholder = document.getElementById('path-upload-placeholder');
+    pathElements.previewImage = document.getElementById('path-preview-image');
+    pathElements.clearImage = document.getElementById('path-clear-image');
+    pathElements.imageUrlInput = document.getElementById('path-image-url-input');
+    pathElements.loadUrlBtn = document.getElementById('path-load-url-btn');
+    pathElements.threejsContainer = document.getElementById('path-threejs-container');
+    pathElements.clearWaypointsBtn = document.getElementById('clear-waypoints-btn');
+    pathElements.undoWaypointBtn = document.getElementById('undo-waypoint-btn');
+    pathElements.placementZoomLabel = document.getElementById('placement-zoom-label');
+    pathElements.waypointsList = document.getElementById('waypoints-list');
+    pathElements.waypointCount = document.getElementById('waypoint-count');
+    pathElements.generateKeyframesBtn = document.getElementById('generate-keyframes-btn');
+    pathElements.keyframeProgress = document.getElementById('keyframe-progress');
+    pathElements.keyframeProgressFill = document.getElementById('keyframe-progress-fill');
+    pathElements.keyframeProgressText = document.getElementById('keyframe-progress-text');
+    pathElements.gallery = document.getElementById('keyframes-gallery');
+    pathElements.downloadAllBtn = document.getElementById('download-all-btn');
+    pathElements.videoDuration = document.getElementById('video-duration');
+    pathElements.transitionStyle = document.getElementById('transition-style');
+    pathElements.videoFps = document.getElementById('video-fps');
+    pathElements.easeType = document.getElementById('ease-type');
+    pathElements.generateVideoBtn = document.getElementById('generate-video-btn');
+    pathElements.videoProgress = document.getElementById('video-progress');
+    pathElements.videoProgressFill = document.getElementById('video-progress-fill');
+    pathElements.videoProgressText = document.getElementById('video-progress-text');
+    pathElements.videoCanvas = document.getElementById('video-canvas');
+    pathElements.finalVideo = document.getElementById('final-video');
+    pathElements.videoEmptyState = document.getElementById('video-empty-state');
+    pathElements.downloadVideoBtn = document.getElementById('download-video-btn');
+    pathElements.aiPrompt = document.getElementById('ai-prompt');
+    pathElements.aiDuration = document.getElementById('ai-duration');
+    pathElements.aiResolution = document.getElementById('ai-resolution');
+    pathElements.aiPairSeconds = document.getElementById('ai-pair-seconds');
+    pathElements.statusMessage = document.getElementById('path-status-message');
+    pathElements.logsContainer = document.getElementById('path-logs-container');
+    pathElements.clearLogsBtn = document.getElementById('path-clear-logs');
+    
+    // Initialize Single Angle
     setupEventListeners();
     initThreeJS();
     updateSliderValues();
     updatePromptDisplay();
     updateGenerateButton();
     
+    // Initialize Tab Switching
+    setupTabSwitching();
+    
+    // Initialize Camera Path
+    setupPathEventListeners();
+    updateWaypointsList();
+    updatePathButtons();
+    updateGallery();
+    
     // Try to load API key from localStorage
     const savedKey = localStorage.getItem('fal_api_key');
     if (savedKey) {
         elements.apiKey.value = savedKey;
         updateGenerateButton();
+        updatePathButtons();
     }
     
     // Save API key on change
