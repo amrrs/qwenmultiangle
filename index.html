@@ -350,6 +350,29 @@
                                 <span>Tip: Generate keyframes first in Multi-image, then come here to create camera motion video.</span>
                             </div>
                         </div>
+
+                        <div class="panel-card videos-card">
+                            <h3 class="card-title">Final Video</h3>
+                            <div id="video-preview-container" class="video-preview-container">
+                                <div class="videos-empty" id="video-empty-state">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                        <polygon points="23 7 16 12 23 17 23 7"/>
+                                        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+                                    </svg>
+                                    <p>Generated video will appear here</p>
+                                </div>
+                                <video id="final-video" class="final-video hidden" controls loop></video>
+                                <canvas id="video-canvas" class="hidden"></canvas>
+                            </div>
+                            <button id="download-video-btn" class="download-btn hidden">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                                    <polyline points="7 10 12 15 17 10"/>
+                                    <line x1="12" y1="15" x2="12" y2="3"/>
+                                </svg>
+                                Download Video
+                            </button>
+                        </div>
                     </section>
                     <section class="right-panel">
                         <div class="panel-card video-card">
@@ -467,29 +490,6 @@
                                 </div>
                                 <span id="video-progress-text" class="progress-text">Rendering...</span>
                             </div>
-                        </div>
-
-                        <div class="panel-card videos-card">
-                            <h3 class="card-title">Final Video</h3>
-                            <div id="video-preview-container" class="video-preview-container">
-                                <div class="videos-empty" id="video-empty-state">
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                                        <polygon points="23 7 16 12 23 17 23 7"/>
-                                        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
-                                    </svg>
-                                    <p>Generated video will appear here</p>
-                                </div>
-                                <video id="final-video" class="final-video hidden" controls loop></video>
-                                <canvas id="video-canvas" class="hidden"></canvas>
-                            </div>
-                            <button id="download-video-btn" class="download-btn hidden">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-                                    <polyline points="7 10 12 15 17 10"/>
-                                    <line x1="12" y1="15" x2="12" y2="3"/>
-                                </svg>
-                                Download Video
-                            </button>
                         </div>
                     </section>
                 </main>
