@@ -5,6 +5,9 @@ import { fal } from "https://esm.sh/@fal-ai/client@1.2.1";
 const CONFIG = {
     FAL_MODEL_ID: 'fal-ai/qwen-image-edit-2511-multiple-angles',
     SEEDANCE_MODEL_ID: 'fal-ai/bytedance/seedance/v1.5/pro/image-to-video',
+    KLING26_MODEL_ID: 'fal-ai/kling-video/v2.6/standard/image-to-video',
+    VEO31_FLF_MODEL_ID: 'fal-ai/veo3.1/fast/first-last-frame-to-video',
+    LTX2_MODEL_ID: 'fal-ai/ltx-2-19b/image-to-video',
     MAX_SEED: 2147483647,
     MAX_WAYPOINTS: 4,
     MIN_WAYPOINTS: 2
@@ -47,6 +50,8 @@ let pathState = {
     isGeneratingVideos: false,
     generatedVideoUrl: null,
     generatedVideoBlob: null,
+    generatedVideoUrlMp4: null,
+    generatedVideoBlobMp4: null,
     videoMode: 'quick'       // 'quick' or 'ai'
 };
 
@@ -99,16 +104,81 @@ function hashStringFNV1a(input) {
     return (h >>> 0).toString(16);
 }
 
-function buildSeedanceSegmentsCacheKey({ keyframeUrls, prompt, resolution, seedanceSeconds, loop }) {
+function buildSeedanceSegmentsCacheKey({ keyframeUrls, prompt, resolution, seedanceSeconds, loop, modelId }) {
     // IMPORTANT: do NOT include per-pair seconds here (so you can re-stitch without re-generating)
     const payload = JSON.stringify({
         keyframeUrls,
         prompt,
         resolution,
         seedanceSeconds,
-        loop: !!loop
+        loop: !!loop,
+        modelId: modelId || CONFIG.SEEDANCE_MODEL_ID
     });
     return `seg_${hashStringFNV1a(payload)}`;
+}
+
+function resolveAIVideoModelId(modelKey) {
+    if (modelKey === 'kling26') return CONFIG.KLING26_MODEL_ID;
+    if (modelKey === 'veo31') return CONFIG.VEO31_FLF_MODEL_ID;
+    if (modelKey === 'ltx2') return CONFIG.LTX2_MODEL_ID;
+    return CONFIG.SEEDANCE_MODEL_ID; // default
+}
+
+// ===== MP4 Transcoding (ffmpeg.wasm) =====
+let _ffmpegCtx = null;
+async function getFfmpegCtx() {
+    if (_ffmpegCtx) return _ffmpegCtx;
+
+    // Lazy-load only when needed (MP4 output)
+    const [{ FFmpeg }, { fetchFile, toBlobURL }] = await Promise.all([
+        import('https://esm.sh/@ffmpeg/ffmpeg@0.12.10'),
+        import('https://esm.sh/@ffmpeg/util@0.12.1')
+    ]);
+
+    const ffmpeg = new FFmpeg();
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+    await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm')
+    });
+
+    _ffmpegCtx = { ffmpeg, fetchFile };
+    return _ffmpegCtx;
+}
+
+async function transcodeWebmToMp4(webmBlob, logPrefix = 'MP4') {
+    addPathLog(`${logPrefix}: Loading ffmpeg... (first time can take ~10-30s)`, 'info');
+    const { ffmpeg, fetchFile } = await getFfmpegCtx();
+
+    // Clean up old files if any
+    try { await ffmpeg.deleteFile('in.webm'); } catch (_) {}
+    try { await ffmpeg.deleteFile('out.mp4'); } catch (_) {}
+
+    await ffmpeg.writeFile('in.webm', await fetchFile(webmBlob));
+
+    // Try H.264 first (best compatibility). If not available in the wasm build, fall back to MPEG-4.
+    try {
+        addPathLog(`${logPrefix}: Transcoding to H.264 MP4...`, 'info');
+        await ffmpeg.exec([
+            '-i', 'in.webm',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            'out.mp4'
+        ]);
+    } catch (e1) {
+        addPathLog(`${logPrefix}: H.264 codec unavailable; falling back to MPEG-4...`, 'warn');
+        await ffmpeg.exec([
+            '-i', 'in.webm',
+            '-c:v', 'mpeg4',
+            '-q:v', '4',
+            '-movflags', '+faststart',
+            'out.mp4'
+        ]);
+    }
+
+    const data = await ffmpeg.readFile('out.mp4');
+    return new Blob([data.buffer], { type: 'video/mp4' });
 }
 
 // ===== Utility Functions =====
@@ -2414,6 +2484,8 @@ async function generateTransitionVideo() {
     
     pathState.generatedVideoUrl = videoUrl;
     pathState.generatedVideoBlob = videoBlob;
+    pathState.generatedVideoUrlMp4 = null;
+    pathState.generatedVideoBlobMp4 = null;
     
     // Show video
     pathElements.finalVideo.src = videoUrl;
@@ -2432,6 +2504,19 @@ async function generateTransitionVideo() {
     
     showPathStatus('Video created!', 'success');
     addPathLog('Video rendering complete', 'response');
+
+    // Also create an MP4 in the background (optional but requested)
+    try {
+        showPathStatus('Transcoding to MP4...', 'info');
+        const mp4Blob = await transcodeWebmToMp4(videoBlob, 'Quick');
+        pathState.generatedVideoBlobMp4 = mp4Blob;
+        pathState.generatedVideoUrlMp4 = URL.createObjectURL(mp4Blob);
+        pathElements.finalVideo.src = pathState.generatedVideoUrlMp4;
+        showPathStatus('MP4 ready!', 'success');
+        addPathLog('Quick: MP4 transcoding complete', 'response');
+    } catch (e) {
+        addPathLog(`Quick: MP4 transcoding failed, keeping WebM. ${formatError(e)}`, 'warn');
+    }
 }
 
 // Helper: Draw image with zoom and offset
@@ -2480,6 +2565,55 @@ async function generateAIVideo() {
     
     const prompt = pathElements.aiPrompt?.value || 'The camera very slowly and smoothly lowers on a boom. The subject moves barely moves, and is extremely deliberate and thoughtful in his movement.';
     const resolution = pathElements.aiResolution?.value || '720p';
+    const modelKey = pathElements.aiVideoModel?.value || 'seedance';
+    const modelId = resolveAIVideoModelId(modelKey);
+
+    // Veo 3.1 Fast is first/last-frame-to-video: generate ONE video from first to last keyframe
+    // (no per-pair stitching workflow).
+    if (modelKey === 'veo31') {
+        const first = keyframes[0];
+        const last = keyframes[keyframes.length - 1];
+
+        addPathLog(`AI video model: ${modelId}`, 'info');
+        addPathLog('Veo mode: generating one video from first→last keyframe (ignores loop/pair seconds).', 'info');
+
+        fal.config({ credentials: apiKey });
+
+        try {
+            const result = await fal.subscribe(modelId, {
+                input: {
+                    prompt,
+                    first_frame_url: first.generatedImageUrl,
+                    last_frame_url: last.generatedImageUrl
+                },
+                logs: false
+            });
+
+            const videoUrl = result?.data?.video?.url || result?.video?.url;
+            if (!videoUrl) throw new Error('No video in response');
+
+            pathState.generatedVideoUrl = videoUrl;
+            pathState.generatedVideoBlob = null;
+            pathState.generatedVideoUrlMp4 = videoUrl; // Veo returns mp4
+            pathState.generatedVideoBlobMp4 = null;
+
+            pathElements.finalVideo.src = videoUrl;
+            pathElements.finalVideo.classList.remove('hidden');
+            pathElements.videoEmptyState.classList.add('hidden');
+            pathElements.downloadVideoBtn.classList.remove('hidden');
+
+            showPathStatus('Veo video generated!', 'success');
+            addPathLog(`Veo video ready: ${videoUrl.substring(0, 60)}...`, 'response');
+        } catch (e) {
+            showPathStatus(`Veo failed: ${formatError(e)}`, 'error');
+            addPathLog(`Veo error: ${formatError(e)}`, 'error');
+        } finally {
+            pathState.isGeneratingVideos = false;
+            resetVideoUI();
+        }
+
+        return;
+    }
     const pairSeconds = parseFloat(pathElements.aiPairSeconds?.value || '1');
     const seedanceSegmentSeconds = 4; // API minimum
     const speedMultiplier = seedanceSegmentSeconds / Math.max(0.5, pairSeconds);
@@ -2491,12 +2625,14 @@ async function generateAIVideo() {
         prompt,
         resolution,
         seedanceSeconds: seedanceSegmentSeconds,
-        loop: loopPath
+        loop: loopPath,
+        modelId
     });
     
     fal.config({ credentials: apiKey });
     
-    addPathLog(`Generating ${totalSegments} Seedance segments (${seedanceSegmentSeconds}s each → ${pairSeconds}s after speedup, ${speedMultiplier.toFixed(2)}x)`, 'info');
+    addPathLog(`AI video model: ${modelId}`, 'info');
+    addPathLog(`Generating ${totalSegments} segments (${seedanceSegmentSeconds}s each → ${pairSeconds}s after speedup, ${speedMultiplier.toFixed(2)}x)`, 'info');
     addPathLog(`Prompt: "${prompt}"`, 'info');
     
     // Step 1: Use cached Seedance segment URLs if available (so we don’t re-queue every time)
@@ -2521,7 +2657,13 @@ async function generateAIVideo() {
             addPathLog(`Segment ${i + 1}: Frame ${i + 1} (Az=${startFrame.azimuth}°) → Frame ${endLabel} (Az=${endFrame.azimuth}°)`, 'request');
             
             try {
-                const result = await fal.subscribe(CONFIG.SEEDANCE_MODEL_ID, {
+                // LTX-2 image-to-video does not support end frame in its schema (image_url only).
+                // We keep it in the dropdown for future workflows, but block pair-based generation for now.
+                if (modelKey === 'ltx2') {
+                    throw new Error('LTX-2 image-to-video does not support start+end frame pairs. Choose Seedance or Kling 2.6 for keyframe-to-keyframe motion.');
+                }
+
+                const result = await fal.subscribe(modelId, {
                     input: {
                         prompt: prompt,
                         image_url: startFrame.generatedImageUrl,
@@ -2591,6 +2733,8 @@ async function generateAIVideo() {
         
         pathState.generatedVideoBlob = finalBlob;
         pathState.generatedVideoUrl = URL.createObjectURL(finalBlob);
+        pathState.generatedVideoUrlMp4 = null;
+        pathState.generatedVideoBlobMp4 = null;
         
         pathElements.finalVideo.src = pathState.generatedVideoUrl;
         pathElements.finalVideo.classList.remove('hidden');
@@ -2603,6 +2747,19 @@ async function generateAIVideo() {
         const finalDuration = segmentUrls.length * pairSeconds;
         showPathStatus(`Done! ${finalDuration} second video`, 'success');
         addPathLog(`Final video: ~${finalDuration} seconds (${segmentUrls.length} segments × ${pairSeconds}s)`, 'response');
+
+        // Also produce an MP4 (best compatibility)
+        try {
+            showPathStatus('Transcoding to MP4...', 'info');
+            const mp4Blob = await transcodeWebmToMp4(finalBlob, 'AI');
+            pathState.generatedVideoBlobMp4 = mp4Blob;
+            pathState.generatedVideoUrlMp4 = URL.createObjectURL(mp4Blob);
+            pathElements.finalVideo.src = pathState.generatedVideoUrlMp4;
+            showPathStatus('MP4 ready!', 'success');
+            addPathLog('AI: MP4 transcoding complete', 'response');
+        } catch (e) {
+            addPathLog(`AI: MP4 transcoding failed, keeping WebM. ${formatError(e)}`, 'warn');
+        }
         
     } catch (err) {
         addPathLog(`Stitch error: ${formatError(err)}`, 'error');
@@ -2779,21 +2936,39 @@ function generateVideo() {
 
 // Download video
 async function downloadVideo() {
-    // For quick stitch (blob)
-    if (pathState.generatedVideoBlob) {
-        const url = URL.createObjectURL(pathState.generatedVideoBlob);
+    // Prefer MP4 if we have it
+    if (pathState.generatedVideoBlobMp4) {
+        const url = URL.createObjectURL(pathState.generatedVideoBlobMp4);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `camera-path-video-${Date.now()}.webm`;
+        a.download = `camera-motion-${Date.now()}.mp4`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        addPathLog('Video downloaded', 'info');
+        addPathLog('MP4 downloaded', 'info');
+        return;
+    }
+
+    // For stitched webm (fallback)
+    if (pathState.generatedVideoBlob) {
+        const url = URL.createObjectURL(pathState.generatedVideoBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `camera-motion-${Date.now()}.webm`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        addPathLog('WebM downloaded', 'info');
         return;
     }
     
-    // For AI video (URL)
+    // For AI / remote URL (fallback)
+    if (pathState.generatedVideoUrlMp4) {
+        window.open(pathState.generatedVideoUrlMp4, '_blank');
+        return;
+    }
     if (pathState.generatedVideoUrl) {
         try {
             addPathLog('Downloading video...', 'info');
@@ -2802,7 +2977,7 @@ async function downloadVideo() {
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `camera-path-ai-video-${Date.now()}.mp4`;
+            a.download = `camera-motion-${Date.now()}.mp4`;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
@@ -2970,6 +3145,7 @@ function init() {
     pathElements.aiResolution = document.getElementById('ai-resolution');
     pathElements.aiPairSeconds = document.getElementById('ai-pair-seconds');
     pathElements.aiLoopPath = document.getElementById('ai-loop-path');
+    pathElements.aiVideoModel = document.getElementById('ai-video-model');
     pathElements.statusMessage = document.getElementById('path-status-message');
     pathElements.logsContainer = document.getElementById('path-logs-container');
     pathElements.clearLogsBtn = document.getElementById('path-clear-logs');

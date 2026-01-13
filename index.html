@@ -418,6 +418,15 @@
 
                             <div class="video-settings hidden" id="ai-settings">
                                 <div class="setting-group">
+                                    <label for="ai-video-model">AI Video Model</label>
+                                    <select id="ai-video-model">
+                                        <option value="seedance" selected>Seedance 1.5 Pro (start+end)</option>
+                                        <option value="kling26">Kling v2.6 Standard (start+end)</option>
+                                        <option value="veo31">Veo 3.1 Fast (first+last only)</option>
+                                        <option value="ltx2">LTX-2 19B (image-only)</option>
+                                    </select>
+                                </div>
+                                <div class="setting-group">
                                     <label for="ai-prompt">Motion Prompt</label>
                                     <textarea id="ai-prompt" rows="2">The camera very slowly and smoothly lowers on a boom. The subject moves barely moves, and is extremely deliberate and thoughtful in his movement.</textarea>
                                 </div>
