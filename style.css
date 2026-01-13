@@ -42,6 +42,11 @@
     
     --transition-fast: 150ms ease;
     --transition-normal: 250ms ease;
+
+    /* Subtle global texture */
+    --bg-grid-opacity: 0.06;
+    --bg-grid-size: 26px;
+    --bg-grid-dot: rgba(240, 240, 242, var(--bg-grid-opacity));
 }
 
 /* ===== Reset & Base ===== */
@@ -66,6 +71,27 @@ body {
     background-image: 
         radial-gradient(ellipse at 0% 0%, rgba(233, 61, 130, 0.04) 0%, transparent 50%),
         radial-gradient(ellipse at 100% 100%, rgba(233, 61, 130, 0.02) 0%, transparent 50%);
+}
+
+/* Global dot grid overlay (very subtle, fades with vignette) */
+body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
+        radial-gradient(circle at 1px 1px, var(--bg-grid-dot) 1px, transparent 0);
+    background-size: var(--bg-grid-size) var(--bg-grid-size);
+    opacity: 1;
+    mask-image: radial-gradient(ellipse at center, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.15) 55%, rgba(0,0,0,0) 100%);
+    -webkit-mask-image: radial-gradient(ellipse at center, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.15) 55%, rgba(0,0,0,0) 100%);
+}
+
+/* Ensure app content renders above the overlay */
+.app-container {
+    position: relative;
+    z-index: 1;
 }
 
 a {
