@@ -46,6 +46,7 @@ let pathState = {
     uploadedImage: null,
     uploadedImageBase64: null,
     imageUrl: null,
+    sourceImageUrl: null,    // Resolved URL used as the base input image (for video start frame)
     isGeneratingKeyframes: false,
     isGeneratingVideos: false,
     generatedVideoUrl: null,
@@ -1483,6 +1484,7 @@ function syncPathImageFromSingleAngle() {
     // Copy URL-based image
     if (state.imageUrl) {
         pathState.imageUrl = state.imageUrl;
+        pathState.sourceImageUrl = state.imageUrl;
         pathState.uploadedImage = null;
         pathState.uploadedImageBase64 = null;
 
@@ -1505,6 +1507,7 @@ function syncPathImageFromSingleAngle() {
         pathState.uploadedImage = state.uploadedImage;
         pathState.uploadedImageBase64 = state.uploadedImageBase64;
         pathState.imageUrl = null;
+        pathState.sourceImageUrl = null; // will be resolved (uploaded) on generation
 
         if (pathElements.imageUrlInput) pathElements.imageUrlInput.value = '';
         if (pathElements.previewImage) {
@@ -1518,6 +1521,28 @@ function syncPathImageFromSingleAngle() {
         if (pathThreeScene) pathThreeScene.updateImage(state.uploadedImageBase64);
         addPathLog('Synced image from Single Angle tab (uploaded file)', 'info');
     }
+}
+
+async function ensurePathSourceImageUrl() {
+    // Prefer already resolved URL
+    if (pathState.sourceImageUrl) return pathState.sourceImageUrl;
+
+    // If user provided an image URL
+    if (pathState.imageUrl) {
+        pathState.sourceImageUrl = pathState.imageUrl;
+        return pathState.sourceImageUrl;
+    }
+
+    // If user uploaded a file, upload once and cache URL
+    if (pathState.uploadedImage) {
+        addPathLog('Uploading source image (for video start frame)...', 'request');
+        const url = await fal.storage.upload(pathState.uploadedImage);
+        pathState.sourceImageUrl = url;
+        addPathLog(`Source image uploaded: ${url}`, 'response');
+        return url;
+    }
+
+    return null;
 }
 
 // ===== Path Three.js Scene =====
@@ -1865,6 +1890,16 @@ function initPathThreeJS() {
             }
         }
     };
+
+    // If an image was uploaded/synced before the 3D scene initialized, apply it now.
+    const initialUrl = pathState.uploadedImageBase64 || pathState.imageUrl || null;
+    if (initialUrl) {
+        try {
+            pathThreeScene.updateImage(initialUrl);
+        } catch (_) {
+            // no-op; scene will stay with placeholder
+        }
+    }
 }
 
 // ===== Path Logging =====
@@ -1986,6 +2021,7 @@ function handlePathImageUpload(file) {
     reader.onload = (e) => {
         pathState.uploadedImage = file;
         pathState.uploadedImageBase64 = e.target.result;
+        pathState.sourceImageUrl = null; // will be resolved (uploaded) when needed
         
         pathElements.previewImage.src = e.target.result;
         pathElements.previewImage.classList.remove('hidden');
@@ -2003,6 +2039,7 @@ function clearPathImage() {
     pathState.uploadedImage = null;
     pathState.uploadedImageBase64 = null;
     pathState.imageUrl = null;
+    pathState.sourceImageUrl = null;
     
     pathElements.previewImage.src = '';
     pathElements.previewImage.classList.add('hidden');
@@ -2028,6 +2065,7 @@ function loadPathImageFromUrl(url) {
     pathState.uploadedImage = null;
     pathState.uploadedImageBase64 = null;
     pathState.imageUrl = url;
+    pathState.sourceImageUrl = url;
     
     pathElements.clearImage.classList.remove('hidden');
     pathElements.uploadZone.classList.add('has-image');
@@ -2089,10 +2127,12 @@ async function generateKeyframes() {
     try {
         if (pathState.imageUrl) {
             imageUrl = pathState.imageUrl;
+            pathState.sourceImageUrl = imageUrl;
         } else {
             addPathLog('Uploading source image...', 'request');
             imageUrl = await fal.storage.upload(pathState.uploadedImage);
             addPathLog(`Uploaded: ${imageUrl}`, 'response');
+            pathState.sourceImageUrl = imageUrl;
         }
     } catch (err) {
         showPathStatus('Failed to upload image', 'error');
@@ -2295,7 +2335,16 @@ const easings = {
 
 // ===== Generate Transition Video =====
 async function generateTransitionVideo() {
-    const keyframes = pathState.waypoints.filter(wp => wp.generatedImageUrl);
+    // Include the original input image as the FIRST frame, then the generated keyframes.
+    const genKeyframes = pathState.waypoints.filter(wp => wp.generatedImageUrl);
+    const sourceUrl = pathState.sourceImageUrl || pathState.imageUrl;
+    if (!sourceUrl) {
+        showPathStatus('Missing input image for video start frame. Go to Multi-image and upload an image first.', 'error');
+        return;
+    }
+    // Use first keyframe's params to drive direction for the source frame (purely for transition heuristics)
+    const ref = genKeyframes[0] || { azimuth: 0, elevation: 0, distance: 5 };
+    const keyframes = [{ ...ref, generatedImageUrl: sourceUrl, isSource: true }, ...genKeyframes];
     if (keyframes.length < 2) {
         showPathStatus('Need at least 2 generated keyframes', 'error');
         return;
@@ -2548,11 +2597,19 @@ async function generateAIVideo() {
         return;
     }
     
-    const keyframes = pathState.waypoints.filter(wp => wp.generatedImageUrl);
-    if (keyframes.length < 2) {
-        showPathStatus('Need at least 2 generated keyframes', 'error');
+    // Include source input image as FIRST frame, then generated keyframes
+    const genKeyframes = pathState.waypoints.filter(wp => wp.generatedImageUrl);
+    if (genKeyframes.length < 1) {
+        showPathStatus('Need at least 1 generated keyframe (run Multi-image first)', 'error');
         return;
     }
+    const sourceUrl = pathState.sourceImageUrl || pathState.imageUrl;
+    if (!sourceUrl) {
+        showPathStatus('Missing input image for video start frame. Go to Multi-image and upload an image first.', 'error');
+        return;
+    }
+    const ref = genKeyframes[0];
+    const keyframes = [{ ...ref, generatedImageUrl: sourceUrl, isSource: true }, ...genKeyframes];
     
     pathState.isGeneratingVideos = true;
     pathState.segmentVideos = [];
